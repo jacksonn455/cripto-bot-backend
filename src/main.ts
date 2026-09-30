@@ -29,8 +29,11 @@ async function bootstrap() {
     SwaggerModule.setup('docs', app, document);
   }
 
-  const port = process.env.PORT ?? 8000;
+  // Render injects PORT; 8000 is the local fallback.
+  const port = Number(process.env.PORT) || 8000;
   // 0.0.0.0 (default) = reachable from the network/Docker; 127.0.0.1 = only this machine.
-  await app.listen(port, process.env.HOST || '0.0.0.0');
+  const host = process.env.HOST || '0.0.0.0';
+  await app.listen(port, host);
+  app.get(Logger).log(`Server listening on ${host}:${port}`, 'Bootstrap');
 }
 void bootstrap();

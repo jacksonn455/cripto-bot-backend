@@ -53,7 +53,7 @@ export class ReconciliationService implements OnModuleInit, OnModuleDestroy {
     const mode = this.trading.mode;
     if (mode === 'PAPER') {
       this.ok = true; // nothing real to reconcile against
-      await this.controlService.recordReconciliation(true);
+      await this.recordResult(true);
       return;
     }
 
@@ -68,11 +68,20 @@ export class ReconciliationService implements OnModuleInit, OnModuleDestroy {
       }
 
       this.ok = true;
-      await this.controlService.recordReconciliation(true);
+      await this.recordResult(true);
     } catch (err) {
       this.logger.error(`Reconciliation failed: ${(err as Error).message}`);
       this.ok = false;
-      await this.controlService.recordReconciliation(false);
+      await this.recordResult(false);
+    }
+  }
+
+  /** Persisting the outcome is bookkeeping: a Mongo outage must not abort bootstrap or crash the interval. */
+  private async recordResult(ok: boolean): Promise<void> {
+    try {
+      await this.controlService.recordReconciliation(ok);
+    } catch (err) {
+      this.logger.error(`Could not record reconciliation result: ${(err as Error).message}`);
     }
   }
 
