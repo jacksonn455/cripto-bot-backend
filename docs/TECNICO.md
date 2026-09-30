@@ -89,7 +89,7 @@ Documentação Swagger: http://localhost:8000/docs
 src/
   config/         # validação de env (Joi) + config factories tipadas
   database/       # conexão Mongoose
-  cache/          # RedisCacheService (cache de reports/charts, fail-open se Redis cair)
+  cache/          # RedisCacheService (cache de reports/charts, fail-open, timeout e reconexão limitada)
   exchange/       # interface ExchangeGateway + Binance (testnet) + Paper
   market-data/    # candles históricos com paginação + cache Mongo (HistoricalCandlesService)
   strategy/       # interface Strategy + TrendRegimeStrategy + registry
@@ -101,7 +101,8 @@ src/
   reports/        # métricas (PnL, drawdown, Sharpe...) e agregações Mongo, cacheadas no Redis
   funding/        # scanner de funding rate (somente leitura, agendado)
   control/        # bot_state, pause/resume/kill switch, auto-pausa por limites de risco
-  notifications/  # Telegram (opcional), atrás da interface Notifier
+  notifications/  # NotificationProvider: Discord (embeds) e Telegram, disparados por eventos de domínio
+  ai/             # OpenAI Agents: agentes de análise com ferramentas somente leitura
   events/         # ponte de eventos de domínio -> SSE para o painel
 ```
 
@@ -163,6 +164,175 @@ gráficos a cada poucos segundos. `RedisCacheService` ([src/cache](../src/cache)
 - **`REDIS_URL`** (padrão `redis://localhost:6379`, ou `redis://redis:6379` dentro do Docker
   Compose) e **`REPORTS_CACHE_TTL_SECONDS`** (padrão `30`) ficam no `.env`.
 
+### Redis: onde é usado e o que acontece sem ele
+
+| Uso | Onde | Classificação | Sem Redis |
+|---|---|---|---|
+| Cache de `/reports/summary`, `by-strategy`, `by-symbol`, `by-side`, `by-hour`, `compare-modes` | `ReportsService` | Cache / performance | Consulta o Mongo direto (mesmo resultado, mais lento) |
+| Cache de `/reports/equity-curve` | `EquitySnapshotsService` | Cache / performance | Consulta o Mongo direto |
+| Invalidação `reports:*` em `trade.opened/closed`, `backtest.completed`, novos snapshots | `ReportsService`, `EquitySnapshotsService` | Cache | No-op (não há o que invalidar) |
+| `GET /health` → `redis` | `HealthController` | Observabilidade | `status: "disabled"` (desligado de propósito) ou `ok: false` (fora do ar) → `degraded` |
+
+**Nenhum fluxo depende obrigatoriamente do Redis**: estratégia, risco, execução, reconciliação, kill
+switch e estado do bot (`bot_state`) vivem no Mongo e em memória. Por isso o fallback é sempre seguro.
+
+Comportamento com o Redis fora do ar ou travado:
+
+- **Sem fila offline**: comandos nunca ficam acumulando em memória esperando o Redis voltar.
+- **Enquanto não está `ready`**, cada chamada é um *cache miss* imediato, sem erro e sem um log por request.
+- **Timeout por comando** (`REDIS_COMMAND_TIMEOUT_MS`, padrão 500 ms): um Redis conectado mas travado custa
+  no máximo isso por chamada antes do fallback, em vez de segurar a request.
+- **Reconexão limitada**: backoff exponencial (0,5 s → 30 s) por `REDIS_MAX_RECONNECT_ATTEMPTS` (padrão 10,
+  ≈2,5 min), depois desiste. A partir daí faz **no máximo uma tentativa a cada 5 min**, e só quando o cache é
+  usado. Não há loop infinito e o Redis consegue voltar sozinho.
+- **Logs com throttle**: `[Redis] unavailable - using fallback (...)` no máximo 1×/min; `[Redis] connected` /
+  `reconnected`; *hit/miss* em nível `debug`.
+- **Erros reais não são mascarados**: só erros do cache são engolidos. Se a query do Mongo (a `factory` do
+  `getOrSet`) falhar, o erro propaga normalmente.
+- `REDIS_ENABLED=false` (ou `REDIS_URL=`) desliga o cache sem tentar conectar. O painel mostra
+  "desativado (opcional)" em vez de erro. Era essa a mensagem "indisponível" em produção no Render, onde o
+  cache está desligado de propósito.
+
+## Long e Short
+
+Fluxo idêntico para os dois lados — `SIGNAL → RISK → ENTRY → POSITION → EXIT → PNL → EVENT → REPORT`. O
+lado só decide qual ordem abre/fecha e o sinal do PnL
+([`position-math.util.ts`](../src/trades/position-math.util.ts), usado por execução, reconciliação, kill
+switch e backtest):
+
+| | LONG | SHORT |
+|---|---|---|
+| Regime (EMA200 no timeframe de regime) | close > EMA | close < EMA |
+| Gatilho | EMA rápida cruza **acima** da lenta | EMA rápida cruza **abaixo** da lenta |
+| Filtro RSI | `[rsiMin, rsiMax]` (45–70) | espelhado: `[100−rsiMax, 100−rsiMin]` (30–55) |
+| Stop inicial | entrada − `atrStopMultiplier`×ATR | entrada + `atrStopMultiplier`×ATR |
+| Saída por sinal | cruzamento para baixo | cruzamento para cima |
+| Trailing (chandelier) | máxima(22) − 3×ATR | mínima(22) + 3×ATR |
+| Ordem de entrada / saída | BUY / SELL | SELL / BUY |
+| Stop intra-candle (paper/backtest) | `low ≤ stop` | `high ≥ stop` |
+| PnL | `(saída − entrada) × qtd` | `(entrada − saída) × qtd` |
+| `pnlPct` | `(saída − entrada)/entrada` | `(entrada − saída)/entrada` |
+
+**Por que não havia Short (diagnóstico: caso A):** a estratégia simplesmente não tinha lógica de Short —
+`ENTER_SHORT` existia no tipo `SignalAction`, mas nunca era emitido. Além disso, execução, backtest,
+reconciliação, kill switch e equity estavam fixos em `LONG`/`BUY`/`SELL` e calculavam o PnL sempre como
+long. Ou seja, mesmo que o sinal existisse, um short seria executado e contabilizado errado.
+
+**Onde o Short roda:**
+
+- `TREND_ALLOW_SHORT=true` liga o lado Short (**padrão `false`**: produção não muda sem evidência). Nos
+  backtests, use `strategyParams: { "allowShort": 1 }`. Quando está em `0`, o parâmetro fica fora do hash,
+  então rodadas long-only continuam com o mesmo hash de antes.
+- **PAPER**: simulado. A carteira fica com saldo negativo do ativo base, e o poder de compra desconta o
+  nocional do short como colateral 1:1. Não há modelagem de juros, funding ou liquidação.
+- **LIVE (Binance Spot)**: **não é possível shortar no Spot**, porque não existe empréstimo do ativo. O
+  gateway declara `supportsShortSelling = false` e o RiskManager veta com `SHORT_NOT_SUPPORTED` (fica
+  registrado em `signals`) em vez de mandar um SELL a descoberto. Short real exigiria um gateway de Binance
+  Margin (borrow/repay) ou USDⓈ-M Futures (alavancagem, funding, liquidação): é uma evolução separada.
+- **Backtest**: `shortBorrowPctPerDay` (padrão 0,0003 = 0,03%/dia) cobra o custo de carregar o short.
+
+Relatórios: `summary.bySide.{LONG,SHORT}`, `longCount/shortCount`, `GET /reports/by-side` e filtro `side`
+em `/reports/*` e `/trades`. Eventos `trade.opened/closed` agora carregam lado, estratégia, timeframe,
+preços, quantidade, PnL, % e motivo.
+
+## Notificações (Discord / Telegram)
+
+A lógica de trading só emite eventos de domínio (`trade.opened`, `trade.closed`, `alert.critical`,
+`bot.paused`, `bot.resumed`). O `NotificationsService` repassa cada evento a todos os
+`NotificationProvider` habilitados que aceitam aquela categoria:
+
+```
+notifications/
+  notification.types.ts          # NotificationProvider (interface), Notification, formatadores
+  notifications.service.ts       # escuta os eventos e faz o fan-out (fire-and-forget)
+  http-delivery.util.ts          # POST JSON com timeout, retry controlado, redaction de segredos
+  discord/                       # DiscordNotificationProvider + formatador de embeds
+  telegram/                      # TelegramNotificationProvider
+```
+
+- **Discord** (`DISCORD_ENABLED=true` + `DISCORD_WEBHOOK_URL`): embeds com lado, modo, timeframe,
+  estratégia, entrada/saída, quantidade, nocional, stop, PnL, %, motivo, duração, taxas e timestamp. Verde
+  para lucro, vermelho para prejuízo, azul/laranja na abertura de LONG/SHORT. O texto é truncado aos limites
+  do Discord e o `allowed_mentions` é vazio (nada pinga @everyone).
+- **Telegram**: mantém o comportamento anterior (liga com token + chat; só alertas por padrão). Agora com
+  timeout e checagem da resposta.
+- `DISCORD_EVENTS` / `TELEGRAM_EVENTS` escolhem as categorias `alerts` e/ou `trades` por canal.
+- **Resiliência**: timeout por tentativa (`NOTIFICATIONS_TIMEOUT_MS`). Retry único só em 5xx, erro de conexão
+  e 429 com `retry_after` ≤ 5 s. **Não** há retry em timeout, porque a mensagem pode ter sido entregue e uma
+  duplicada é pior. Um 401/403/404 desliga o Discord até o próximo restart (webhook apagado ou URL errada). Os
+  handlers retornam na hora, então um canal lento ou fora do ar nunca atrasa nem quebra um trade.
+- **Segurança**: a URL do webhook e o token do Telegram nunca vão para log. Mensagens de erro passam por
+  redaction e o log mostra só `discord.com/…/<id>`. As mensagens de validação do Joi não ecoam o valor.
+
+## Camada de AI (OpenAI Agents)
+
+```
+ai/
+  ai.module.ts / ai.controller.ts / ai.service.ts   # fachada, status, timeouts, concorrência, logs
+  agents/agent-definitions.ts                       # os agentes especializados (prompt + ferramentas)
+  prompts/agent-prompts.ts                          # instruções + guardrails compartilhados
+  tools/trading-data.tools.ts                       # ferramentas SOMENTE LEITURA sobre os serviços existentes
+  tools/tool-policy.ts                              # a barreira de segurança (só tools `read`)
+  providers/openai-agents.runner.ts                 # único arquivo que usa o SDK (@openai/agents)
+```
+
+- **SDK**: `@openai/agents` (Agents SDK oficial para TypeScript) + `openai` + `zod` 4. Usa um `Runner` com
+  cliente OpenAI próprio (chave, timeout e retries vindos do env), não as configurações globais do SDK.
+  Tracing fica desligado por padrão (`OPENAI_TRACING_ENABLED`).
+- **Agentes**: `performance-analyst`, `trade-reviewer`, `signal-explainer`, `risk-analyst`,
+  `market-analyst`. Todos devolvem saída estruturada validada com zod: `summary`, `findings`,
+  `recommendations[{action, rationale, requiresBacktest}]`, `confidence` e `dataUsed`.
+- **Ferramentas** (todas leitura): status do bot, métricas, breakdown por lado/símbolo/estratégia, trades e
+  sinais recentes, configuração da estratégia, snapshot de mercado (só dos símbolos configurados) e
+  execuções de backtest.
+- **Limites de segurança**: não existe caminho de código do agente até `ExecutionService`, ordens,
+  pause/resume/kill switch ou escrita no Mongo. O `tool-policy` recusa qualquer tool que não seja `read`
+  antes de qualquer chamada de rede. As recomendações são só dados, com `advisoryOnly: true`. Para
+  adicionar ações no futuro, é preciso mudar essa política de propósito, passando por `ControlApiKeyGuard`
+  e aprovação humana (`needsApproval` do SDK).
+- **Endpoints**:
+  - `GET /ai/status`.
+  - `POST /ai/agents/:agent/run`, com body `{question?, symbol?, mode?, from?, to?}`. Exige
+    `X-Control-Api-Key` e tem limite de 10 req/min.
+  - Códigos de erro: 503 = desligado/sem chave, 504 = timeout, 502 = erro da OpenAI, 429 = excesso de
+    execuções simultâneas.
+- **Resiliência**:
+  - timeout por request (`OPENAI_REQUEST_TIMEOUT_MS`) e da execução inteira (`OPENAI_AGENT_TIMEOUT_MS`,
+    via AbortSignal);
+  - retries do cliente em 429/5xx (`OPENAI_MAX_RETRIES`);
+  - `OPENAI_AGENT_MAX_TURNS` e `OPENAI_MAX_CONCURRENT_RUNS`.
+  - Nenhum módulo de trading depende do `AiModule`: se a OpenAI cair, só `/ai/*` falha.
+- **Logs**: `[OpenAI] agent request started/completed/failed`, com duração, requests e tokens. Nunca
+  registram a chave nem o texto da pergunta.
+
+## Variáveis de ambiente adicionadas
+
+| Variável | Obrigatória | Padrão | Descrição |
+|---|---|---|---|
+| `TREND_ALLOW_SHORT` | não | `false` | Liga as entradas Short (espelho das regras Long) |
+| `DISCORD_ENABLED` | não | `false` | Liga o canal Discord |
+| `DISCORD_WEBHOOK_URL` | sim, se `DISCORD_ENABLED=true` | — | URL do webhook (secreta) |
+| `DISCORD_USERNAME` | não | `Trade Bot` | Nome exibido nas mensagens |
+| `DISCORD_EVENTS` | não | `alerts,trades` | Categorias enviadas ao Discord |
+| `TELEGRAM_ENABLED` | não | `true` | `false` desliga o Telegram mesmo com token/chat |
+| `TELEGRAM_EVENTS` | não | `alerts` | Categorias enviadas ao Telegram |
+| `NOTIFICATIONS_TIMEOUT_MS` | não | `5000` | Timeout por tentativa HTTP dos canais |
+| `REDIS_ENABLED` | não | `true` | `false` desliga o cache (equivale a `REDIS_URL=`) |
+| `REDIS_COMMAND_TIMEOUT_MS` | não | `500` | Timeout por comando Redis |
+| `REDIS_CONNECT_TIMEOUT_MS` | não | `2000` | Timeout de conexão |
+| `REDIS_MAX_RECONNECT_ATTEMPTS` | não | `10` | Tentativas antes de desistir (depois, 1 re-probe a cada 5 min) |
+| `OPENAI_AGENTS_ENABLED` | não | `false` | Liga a camada de AI |
+| `OPENAI_API_KEY` | sim, se `OPENAI_AGENTS_ENABLED=true` | — | Chave da OpenAI (secreta) |
+| `OPENAI_MODEL` | não | modelo padrão do SDK | Modelo usado pelos agentes |
+| `OPENAI_REQUEST_TIMEOUT_MS` | não | `30000` | Timeout por request à OpenAI |
+| `OPENAI_MAX_RETRIES` | não | `2` | Retries do cliente OpenAI (429/5xx) |
+| `OPENAI_AGENT_TIMEOUT_MS` | não | `90000` | Timeout da execução inteira do agente |
+| `OPENAI_AGENT_MAX_TURNS` | não | `8` | Máximo de turnos (chamadas de modelo) por execução |
+| `OPENAI_MAX_CONCURRENT_RUNS` | não | `2` | Execuções simultâneas permitidas |
+| `OPENAI_TRACING_ENABLED` | não | `false` | Envia traces ao dashboard da OpenAI (contém dados de trading) |
+
+Já existentes, sem mudança de nome: `REDIS_URL`, `REPORTS_CACHE_TTL_SECONDS`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+
 ## Por que não RabbitMQ (por enquanto)
 
 Avaliamos e decidimos **não** adicionar um message broker agora. RabbitMQ resolve problemas que
@@ -199,6 +369,8 @@ mais um ponto de falha, mais configuração) sem resolver nenhum gargalo real.
 - ✅ `GET /reports/summary`, ✅ `/reports/equity-curve`, ✅ `/reports/by-strategy`, ✅ `/reports/by-symbol`,
   ✅ `/reports/by-hour`, ✅ `/reports/compare-modes`
 - ✅ `POST /backtest/run`, ✅ `GET /backtest/runs`, ✅ `GET /backtest/runs/:runId`
+- ✅ `GET /reports/by-side` (LONG vs SHORT); filtro `side` em `/reports/*` e `/trades`
+- ✅ `GET /ai/status`, ✅ `POST /ai/agents/:agent/run` (análise, somente leitura)
 - ✅ `GET /funding/ranking`
 - ✅ `GET /exchange/balance`, ✅ `GET /market/candles` (hoje em `/exchange/candles`)
 - ✅ `GET /events/stream` (SSE: nova trade, atualização de posição, alertas)
@@ -604,6 +776,16 @@ mesma restrição de rede HTTP 451 deste ambiente de desenvolvimento).
   manuais; `mongodb-memory-server` como dependência de teste fica para quando os testes automatizados
   precisarem de banco, hoje todos os specs são unitários/puros).
 - ✅ Teste que prova que a estratégia não usa o candle em formação (sem lookahead).
+- ✅ Long/Short: PnL dos dois lados (inclusive simetria exata), stop/take profit intra-candle por lado,
+  entradas/saídas Short na estratégia, sizing e vetos do risco (`SHORT_NOT_SUPPORTED`, stop/TP do lado
+  errado), execução PAPER (SELL/BUY), stop-limit LIVE do short, kill switch, carteira paper, equity e backtest
+  (carry e slippage do short).
+- ✅ Notificações: envio, erro 5xx com retry, timeout sem retry, 429, webhook 404, canal desabilitado,
+  isolamento entre canais e ausência de segredos nos logs.
+- ✅ Redis: desabilitado, Redis "travado" (servidor RESP falso), fallback, backoff/desistência e erros reais
+  não mascarados.
+- ✅ OpenAI: configuração válida/ausente, desabilitado, erro 401 e timeout **passando pelo SDK real** com
+  `fetch` falso, saída estruturada, limite de concorrência e política de ferramentas.
 
 ## Licença
 

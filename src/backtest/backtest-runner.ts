@@ -2,6 +2,8 @@ import { Candle } from '../exchange/types/candle.type';
 import { RiskContext } from '../risk/risk.interface';
 import { RiskManagerService } from '../risk/risk-manager.service';
 import type { Strategy, StrategyContext } from '../strategy/strategy.interface';
+import { computePnl, entryOrderSide, exitOrderSide, sideFromSignal, unrealizedPnl } from '../trades/position-math.util';
+import type { TradeSide } from '../trades/schemas/trade.schema';
 import {
   BacktestParams,
   BacktestResult,
@@ -11,8 +13,14 @@ import {
 } from './backtest.types';
 import { checkIntraCandleExit } from './intra-candle-exit.util';
 
+const DAY_MS = 86_400_000;
+
 interface OpenPosition {
+  side: TradeSide;
+  /** Fill price, slippage included. */
   entryPrice: number;
+  /** Signal price before slippage, to report the slippage cost. */
+  rawEntryPrice: number;
   qty: number;
   stopLoss: number;
   takeProfit?: number;
@@ -88,7 +96,7 @@ export class BacktestRunner {
           openPosition = null;
         } else {
           const signal = this.tryEvaluate(window, regimeWindow, {
-            side: 'LONG',
+            side: openPosition.side,
             entryPrice: openPosition.entryPrice,
             stopLoss: openPosition.stopLoss,
           });
@@ -105,7 +113,8 @@ export class BacktestRunner {
 
       if (!openPosition) {
         const signal = this.tryEvaluate(window, regimeWindow, null);
-        if (signal && (signal.action === 'ENTER_LONG' || signal.action === 'ENTER_SHORT')) {
+        const side = signal ? sideFromSignal(signal.action) : null;
+        if (signal && side) {
           const riskCtx: RiskContext = {
             accountEquity: balance,
             openPositionsCount: 0,
@@ -115,6 +124,8 @@ export class BacktestRunner {
             consecutiveStopLosses,
             isPaused: false,
             reconciliationOk: true,
+            // The simulation can always short; whether it should is the strategy's allowShort knob.
+            shortSellingSupported: true,
             symbolFilters: this.params.symbolFilters
               ? {
                   symbol: this.params.symbol,
@@ -142,11 +153,13 @@ export class BacktestRunner {
           });
 
           if (decision.approved && decision.qty) {
-            const entryPrice = this.applySlippage(signal.price, 'BUY');
+            const entryPrice = this.applySlippage(signal.price, entryOrderSide(side));
             const fees = entryPrice * decision.qty * this.params.feesPct;
             balance -= fees;
             openPosition = {
+              side,
               entryPrice,
+              rawEntryPrice: signal.price,
               qty: decision.qty,
               stopLoss: signal.stopLoss!,
               takeProfit: signal.takeProfit,
@@ -159,19 +172,21 @@ export class BacktestRunner {
       }
 
       if (openPosition) {
-        const favorable = candle.high - openPosition.entryPrice;
-        const adverse = candle.low - openPosition.entryPrice;
+        // Per-unit excursions in the position's favor/against it: a short gains when price falls.
+        const isShort = openPosition.side === 'SHORT';
+        const favorable = isShort ? openPosition.entryPrice - candle.low : candle.high - openPosition.entryPrice;
+        const adverse = isShort ? openPosition.entryPrice - candle.high : candle.low - openPosition.entryPrice;
         openPosition.mfe = Math.max(openPosition.mfe, favorable);
         openPosition.mae = Math.min(openPosition.mae, adverse);
       }
 
-      const unrealizedPnl = openPosition
-        ? (candle.close - openPosition.entryPrice) * openPosition.qty
+      const openPnl = openPosition
+        ? unrealizedPnl(openPosition.side, openPosition.entryPrice, candle.close, openPosition.qty)
         : 0;
       equityCurve.push({
         timestamp: candle.closeTime,
         balance,
-        equity: balance + unrealizedPnl,
+        equity: balance + openPnl,
         openPositions: openPosition ? 1 : 0,
       });
     }
@@ -188,7 +203,7 @@ export class BacktestRunner {
 
   /**
    * Balance change when a trade closes. The entry fee was already taken from the balance at entry,
-   * while trade.pnl is net of both fees — so add it back to avoid charging it twice.
+   * while trade.pnl is net of all fees — so add it back to avoid charging it twice.
    */
   private settlement(trade: SimulatedTrade): number {
     return trade.pnl + trade.entryPrice * trade.qty * this.params.feesPct;
@@ -213,22 +228,30 @@ export class BacktestRunner {
     exitTime: number,
     reason: SimulatedTrade['exitReason'],
   ): SimulatedTrade {
-    const exitPrice = this.applySlippage(rawExitPrice, 'SELL');
+    const exitPrice = this.applySlippage(rawExitPrice, exitOrderSide(position.side));
     const entryFees = position.entryPrice * position.qty * this.params.feesPct;
     const exitFees = exitPrice * position.qty * this.params.feesPct;
-    const fees = entryFees + exitFees;
-    const pnl = (exitPrice - position.entryPrice) * position.qty - fees;
-    const pnlPct = ((exitPrice - position.entryPrice) / position.entryPrice) * 100;
+    const carryCost =
+      position.side === 'SHORT'
+        ? position.entryPrice * position.qty * (this.params.shortBorrowPctPerDay ?? 0) *
+          (Math.max(0, exitTime - position.entryTime) / DAY_MS)
+        : 0;
+    const fees = entryFees + exitFees + carryCost;
+    const { pnl, pnlPct } = computePnl(position.side, position.entryPrice, exitPrice, position.qty, fees);
+    const slippageCost =
+      (Math.abs(position.entryPrice - position.rawEntryPrice) + Math.abs(exitPrice - rawExitPrice)) * position.qty;
 
     return {
       symbol: this.params.symbol,
-      side: 'LONG',
+      side: position.side,
       entryPrice: position.entryPrice,
       exitPrice,
       qty: position.qty,
       entryTime: position.entryTime,
       exitTime,
       fees,
+      carryCost,
+      slippageCost,
       pnl,
       pnlPct,
       stopLoss: position.stopLoss,

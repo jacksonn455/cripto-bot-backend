@@ -7,6 +7,7 @@ export interface ReportsFilter {
   mode?: string;
   symbol?: string;
   strategy?: string;
+  side?: 'LONG' | 'SHORT';
   from?: string;
   to?: string;
   /** Trade date that from/to apply to; defaults to entryTime. */

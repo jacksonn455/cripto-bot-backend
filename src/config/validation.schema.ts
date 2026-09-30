@@ -1,5 +1,10 @@
 import * as Joi from 'joi';
 
+/** Official webhook hosts (discordapp.com is the legacy one); optional /vN API version. */
+const DISCORD_WEBHOOK =
+  /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+$/;
+const NOTIFICATION_EVENTS = /^\s*(alerts|trades)\s*(,\s*(alerts|trades)\s*)*$/i;
+
 // Fails fast on boot if required env vars are missing or LIVE mode is misconfigured.
 export const validationSchema = Joi.object({
   NODE_ENV: Joi.string()
@@ -100,8 +105,29 @@ export const validationSchema = Joi.object({
   SWAGGER_ENABLED: Joi.boolean().default(true),
 
   // --- Notifications (optional) ---
+  // Secret-bearing values use custom messages: Joi's defaults echo the value into the boot error.
+  TELEGRAM_ENABLED: Joi.boolean().default(true),
   TELEGRAM_BOT_TOKEN: Joi.string().allow('').optional().default(''),
   TELEGRAM_CHAT_ID: Joi.string().allow('').optional().default(''),
+  TELEGRAM_EVENTS: Joi.string().pattern(NOTIFICATION_EVENTS).default('alerts').messages({
+    'string.pattern.base': 'TELEGRAM_EVENTS must be a comma-separated list of: alerts, trades',
+  }),
+  DISCORD_ENABLED: Joi.boolean().default(false),
+  DISCORD_WEBHOOK_URL: Joi.string().when('DISCORD_ENABLED', {
+    is: true,
+    then: Joi.string().pattern(DISCORD_WEBHOOK).required().messages({
+      'string.pattern.base':
+        'DISCORD_WEBHOOK_URL must be a Discord webhook URL (https://discord.com/api/webhooks/<id>/<token>)',
+      'any.required': 'DISCORD_WEBHOOK_URL is required when DISCORD_ENABLED=true',
+      'string.empty': 'DISCORD_WEBHOOK_URL is required when DISCORD_ENABLED=true',
+    }),
+    otherwise: Joi.string().allow('').optional().default(''),
+  }),
+  DISCORD_USERNAME: Joi.string().max(80).default('Trade Bot'),
+  DISCORD_EVENTS: Joi.string().pattern(NOTIFICATION_EVENTS).default('alerts,trades').messages({
+    'string.pattern.base': 'DISCORD_EVENTS must be a comma-separated list of: alerts, trades',
+  }),
+  NOTIFICATIONS_TIMEOUT_MS: Joi.number().integer().min(500).max(30000).default(5000),
 
   // --- Funding scanner (read-only) ---
   FUNDING_SCAN_ENABLED: Joi.boolean().default(true),
@@ -109,6 +135,32 @@ export const validationSchema = Joi.object({
 
   // --- Redis (reports/charts cache) ---
   // Empty string = cache disabled (e.g. a host without Redis); unset = local default.
-  REDIS_URL: Joi.string().uri().allow('').default('redis://localhost:6379'),
+  REDIS_ENABLED: Joi.boolean().default(true),
+  REDIS_URL: Joi.string().uri({ scheme: ['redis', 'rediss'] }).allow('').default('redis://localhost:6379').messages({
+    'string.uri': 'REDIS_URL must be a redis:// or rediss:// URL',
+    'string.uriCustomScheme': 'REDIS_URL must be a redis:// or rediss:// URL',
+  }),
+  REDIS_CONNECT_TIMEOUT_MS: Joi.number().integer().min(100).max(30000).default(2000),
+  REDIS_COMMAND_TIMEOUT_MS: Joi.number().integer().min(50).max(10000).default(500),
+  REDIS_MAX_RECONNECT_ATTEMPTS: Joi.number().integer().min(0).max(1000).default(10),
   REPORTS_CACHE_TTL_SECONDS: Joi.number().integer().positive().default(30),
+
+  // --- OpenAI Agents (optional, analysis only) ---
+  OPENAI_AGENTS_ENABLED: Joi.boolean().default(false),
+  OPENAI_API_KEY: Joi.string().when('OPENAI_AGENTS_ENABLED', {
+    is: true,
+    then: Joi.string().min(20).required().messages({
+      'any.required': 'OPENAI_API_KEY is required when OPENAI_AGENTS_ENABLED=true',
+      'string.empty': 'OPENAI_API_KEY is required when OPENAI_AGENTS_ENABLED=true',
+      'string.min': 'OPENAI_API_KEY looks invalid (too short)',
+    }),
+    otherwise: Joi.string().allow('').optional().default(''),
+  }),
+  OPENAI_MODEL: Joi.string().allow('').max(100).default(''),
+  OPENAI_REQUEST_TIMEOUT_MS: Joi.number().integer().min(1000).max(600000).default(30000),
+  OPENAI_MAX_RETRIES: Joi.number().integer().min(0).max(5).default(2),
+  OPENAI_AGENT_TIMEOUT_MS: Joi.number().integer().min(5000).max(900000).default(90000),
+  OPENAI_AGENT_MAX_TURNS: Joi.number().integer().min(1).max(30).default(8),
+  OPENAI_MAX_CONCURRENT_RUNS: Joi.number().integer().min(1).max(20).default(2),
+  OPENAI_TRACING_ENABLED: Joi.boolean().default(false),
 });

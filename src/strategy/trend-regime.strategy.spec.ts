@@ -37,6 +37,7 @@ const TINY_CONFIG = {
   atrStopMultiplier: 2,
   chandelierLookback: 5,
   chandelierAtrMultiplier: 2,
+  allowShort: 0,
 };
 
 function makeStrategy(configOverrides: Partial<typeof TINY_CONFIG> = {}) {
@@ -125,6 +126,121 @@ describe('TrendRegimeStrategy', () => {
     expect(() =>
       strategy.onCandleClosed({ symbol: 'BTCUSDT', candles } as StrategyContext),
     ).toThrow(/closed/i);
+  });
+});
+
+describe('TrendRegimeStrategy short side (allowShort=1)', () => {
+  // Every scenario below is the long scenario reflected around 100 (p -> 200 - p). EMAs are
+  // linear, so they reflect exactly; RSI becomes 100 - RSI; ATR is unchanged (same ranges).
+  const mirror = (closes: number[]) => closes.map((c) => 200 - c);
+
+  it('enters short on regime-down + EMA death cross + RSI in the mirrored band', () => {
+    const candles = makeCandles(mirror([100, 95, 90, 85, 80, 75, 90])); // [100, 105, ..., 125, 110]
+    const { strategy, indicators } = makeStrategy({ allowShort: 1 });
+
+    const signal = strategy.onCandleClosed({ symbol: 'BTCUSDT', candles });
+
+    const atr = indicators.atr(
+      TINY_CONFIG.atrPeriod,
+      candles.map((c) => c.high),
+      candles.map((c) => c.low),
+      candles.map((c) => c.close),
+    );
+    const lastAtr = atr[atr.length - 1]!;
+    expect(signal.action).toBe('ENTER_SHORT');
+    expect(signal.price).toBe(110);
+    // Stop ABOVE the entry for a short, same ATR distance as the mirrored long.
+    expect(signal.stopLoss).toBeCloseTo(110 + TINY_CONFIG.atrStopMultiplier * lastAtr);
+    expect(signal.stopLoss!).toBeGreaterThan(signal.price);
+    expect(signal.reason).toContain('regime de baixa');
+  });
+
+  it('is symmetric: the short stop distance equals the mirrored long stop distance', () => {
+    const { strategy } = makeStrategy({ allowShort: 1 });
+    const long = strategy.onCandleClosed({ symbol: 'BTCUSDT', candles: makeCandles([100, 95, 90, 85, 80, 75, 90]) });
+    const short = strategy.onCandleClosed({
+      symbol: 'BTCUSDT',
+      candles: makeCandles(mirror([100, 95, 90, 85, 80, 75, 90])),
+    });
+    expect(long.action).toBe('ENTER_LONG');
+    expect(short.action).toBe('ENTER_SHORT');
+    expect(short.stopLoss! - short.price).toBeCloseTo(long.price - long.stopLoss!);
+  });
+
+  it('never shorts when allowShort is off (default): same scenario is a HOLD', () => {
+    const candles = makeCandles(mirror([100, 95, 90, 85, 80, 75, 90]));
+    const { strategy } = makeStrategy();
+
+    const signal = strategy.onCandleClosed({ symbol: 'BTCUSDT', candles });
+
+    expect(signal.action).toBe('NONE');
+    expect(signal.reason).toContain('regime nao esta em alta');
+  });
+
+  it('rejects the short when RSI is outside the mirrored band', () => {
+    // Long band [95,100] mirrors to [0,5] for shorts; the death-cross candle's RSI is well above it.
+    const candles = makeCandles(mirror([100, 95, 90, 85, 80, 75, 90]));
+    const { strategy } = makeStrategy({ allowShort: 1, rsiMin: 95, rsiMax: 100 });
+
+    const signal = strategy.onCandleClosed({ symbol: 'BTCUSDT', candles });
+
+    expect(signal.action).toBe('NONE');
+    expect(signal.reason).toContain('short: RSI fora da faixa');
+  });
+
+  it('does not short in an up regime, even with shorts enabled', () => {
+    // Steady rise: regime up, so only the long rules apply (and there is no golden cross here).
+    const candles = makeCandles([80, 85, 90, 95, 100, 105, 110]);
+    const { strategy } = makeStrategy({ allowShort: 1 });
+
+    const signal = strategy.onCandleClosed({ symbol: 'BTCUSDT', candles });
+
+    expect(signal.action).toBe('NONE');
+  });
+
+  it('exits a short when EMA fast crosses back above EMA slow', () => {
+    const candles = makeCandles(mirror([75, 80, 85, 90, 95, 100, 85]));
+    const { strategy } = makeStrategy({ allowShort: 1 });
+
+    const signal = strategy.onCandleClosed({
+      symbol: 'BTCUSDT',
+      candles,
+      openPosition: { side: 'SHORT', entryPrice: 120, stopLoss: 130 },
+    });
+
+    expect(signal.action).toBe('EXIT');
+    expect(signal.reason).toContain('cruzou acima');
+  });
+
+  it('exits a short on the chandelier trailing stop (close above lowest low + N*ATR)', () => {
+    // 30 candles falling 1/candle, then a +5 bounce: EMA2 stays below EMA20 (no cross), but the
+    // bounce clears lowestLow + 1*ATR.
+    const closes = [...Array.from({ length: 30 }, (_, i) => 200 - i), 176];
+    const candles = makeCandles(closes, candlesRange(closes.length, 0.2));
+    const { strategy } = makeStrategy({ allowShort: 1, emaSlow: 20, chandelierAtrMultiplier: 1 });
+
+    const signal = strategy.onCandleClosed({
+      symbol: 'BTCUSDT',
+      candles,
+      openPosition: { side: 'SHORT', entryPrice: 190, stopLoss: 200 },
+    });
+
+    expect(signal.action).toBe('EXIT');
+    expect(signal.reason).toContain('Chandelier exit (short)');
+  });
+
+  it('keeps a short open while the downtrend continues', () => {
+    const candles = makeCandles(mirror([100, 101, 102, 103, 104, 105, 106]), candlesRange(7, 0.2));
+    const { strategy } = makeStrategy({ allowShort: 1 });
+
+    const signal = strategy.onCandleClosed({
+      symbol: 'BTCUSDT',
+      candles,
+      openPosition: { side: 'SHORT', entryPrice: 100, stopLoss: 105 },
+    });
+
+    expect(signal.action).toBe('NONE');
+    expect(signal.reason).toBe('Posição aberta, sem gatilho de saída');
   });
 });
 

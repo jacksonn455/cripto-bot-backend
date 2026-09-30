@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { appConfig, binanceConfig, controlConfig, executionConfig, fundingConfig, mongoConfig, notificationsConfig, redisConfig, riskConfig, tradingConfig, trendRegimeConfig } from './configuration';
+import { appConfig, binanceConfig, controlConfig, executionConfig, fundingConfig, mongoConfig, notificationsConfig, openAiConfig, redisConfig, riskConfig, tradingConfig, trendRegimeConfig } from './configuration';
 import { validationSchema } from './validation.schema';
 
 @Module({
@@ -21,6 +21,7 @@ import { validationSchema } from './validation.schema';
         notificationsConfig,
         fundingConfig,
         redisConfig,
+        openAiConfig,
       ],
       validate: (config: Record<string, unknown>) => {
         const { error, value } = validationSchema.validate(config, {

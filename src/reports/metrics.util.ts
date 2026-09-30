@@ -10,6 +10,20 @@ export interface ClosedTradeMetricsInput {
   entryTime: Date | number;
   exitTime: Date | number;
   exitReason?: string;
+  /** LONG/SHORT; trades without it count as LONG (everything before shorts existed). */
+  side?: string;
+  /** Quote-currency fees already included in pnl (for the cost breakdown only). */
+  fees?: number;
+}
+
+export interface SideMetrics {
+  tradeCount: number;
+  winCount: number;
+  winRate: number;
+  totalPnl: number;
+  profitFactor: number;
+  expectancy: number;
+  avgReturnPct: number;
 }
 
 export interface MetricsSummary {
@@ -17,7 +31,17 @@ export interface MetricsSummary {
   winCount: number;
   lossCount: number;
   winRate: number;
+  /** lossCount / tradeCount (a zero-pnl trade counts as a loss, as in winRate). */
+  lossRate: number;
   totalPnl: number;
+  grossProfit: number;
+  /** Absolute value of the summed losing trades. */
+  grossLoss: number;
+  totalFees: number;
+  longCount: number;
+  shortCount: number;
+  /** Same core metrics per direction, so long and short results are never judged blended. */
+  bySide: { LONG: SideMetrics; SHORT: SideMetrics };
   avgWin: number;
   avgLoss: number;
   payoffRatio: number;
@@ -64,12 +88,22 @@ export function computeMetrics(
 
   const { maxDrawdown, maxDrawdownPct } = computeDrawdown(sorted, initialBalance);
 
+  const longs = sorted.filter((t) => t.side !== 'SHORT');
+  const shorts = sorted.filter((t) => t.side === 'SHORT');
+
   return {
     tradeCount,
     winCount,
     lossCount,
     winRate: tradeCount ? winCount / tradeCount : 0,
+    lossRate: tradeCount ? lossCount / tradeCount : 0,
     totalPnl,
+    grossProfit,
+    grossLoss,
+    totalFees: sum(sorted.map((t) => t.fees ?? 0)),
+    longCount: longs.length,
+    shortCount: shorts.length,
+    bySide: { LONG: computeSideMetrics(longs), SHORT: computeSideMetrics(shorts) },
     avgWin,
     avgLoss,
     payoffRatio: avgLoss !== 0 ? avgWin / Math.abs(avgLoss) : 0,
@@ -86,6 +120,23 @@ export function computeMetrics(
       : 0,
     exitReasonBreakdown: computeExitReasonBreakdown(sorted),
     pnlHistogram: computePnlHistogram(sorted),
+  };
+}
+
+function computeSideMetrics(trades: ClosedTradeMetricsInput[]): SideMetrics {
+  const tradeCount = trades.length;
+  const wins = trades.filter((t) => t.pnl > 0);
+  const grossProfit = sum(wins.map((t) => t.pnl));
+  const grossLoss = Math.abs(sum(trades.filter((t) => t.pnl <= 0).map((t) => t.pnl)));
+  const totalPnl = sum(trades.map((t) => t.pnl));
+  return {
+    tradeCount,
+    winCount: wins.length,
+    winRate: tradeCount ? wins.length / tradeCount : 0,
+    totalPnl,
+    profitFactor: grossLoss !== 0 ? grossProfit / grossLoss : 0,
+    expectancy: tradeCount ? totalPnl / tradeCount : 0,
+    avgReturnPct: tradeCount ? sum(trades.map((t) => t.pnlPct)) / tradeCount : 0,
   };
 }
 

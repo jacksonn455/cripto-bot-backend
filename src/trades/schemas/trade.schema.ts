@@ -25,6 +25,14 @@ export class Trade {
   @Prop({ required: true, index: true })
   strategy: string;
 
+  /** Candle timeframe the strategy traded on (e.g. "1h"). Absent on trades created before it existed. */
+  @Prop()
+  timeframe?: string;
+
+  /** Strategy's explanation of the entry signal (paper/live only). */
+  @Prop()
+  entryReason?: string;
+
   @Prop({ type: String, required: true, enum: ['BACKTEST', 'PAPER', 'LIVE'], index: true })
   mode: TradeMode;
 

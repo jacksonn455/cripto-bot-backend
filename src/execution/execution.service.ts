@@ -14,13 +14,19 @@ import { SignalsService } from '../risk/signals.service';
 import { StrategyRegistryService } from '../strategy/strategy-registry.service';
 import type { Signal, StrategyContext } from '../strategy/strategy.interface';
 import { OrdersService } from '../trades/orders.service';
-import type { TradeDocument, TradeExitReason, TradeMode } from '../trades/schemas/trade.schema';
+import { entryOrderSide, exitOrderSide, sideFromSignal } from '../trades/position-math.util';
+import type { TradeDocument, TradeExitReason, TradeMode, TradeSide } from '../trades/schemas/trade.schema';
+import { buildTradeOpenedEvent, TRADE_CLOSED, TRADE_OPENED, TradeClosedEvent } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
 import { generateClientOrderId } from './client-order-id.util';
 import { ReconciliationService } from './reconciliation.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
 
+/**
+ * SIGNAL → RISK → ENTRY → POSITION → EXIT → PNL → EVENT, identical for LONG and SHORT: the side
+ * only decides which order opens/closes the position (BUY/SELL) and the sign of the pnl.
+ */
 @Injectable()
 export class ExecutionService {
   private readonly logger = new Logger(ExecutionService.name);
@@ -74,7 +80,7 @@ export class ExecutionService {
     if (openTrade) {
       if (mode === 'PAPER') {
         const intraExit = checkIntraCandleExit(
-          { stopLoss: openTrade.stopLoss, takeProfit: openTrade.takeProfit },
+          { stopLoss: openTrade.stopLoss, takeProfit: openTrade.takeProfit, side: openTrade.side },
           lastCandle,
         );
         if (intraExit) {
@@ -85,13 +91,13 @@ export class ExecutionService {
 
       if (openTrade) {
         const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, {
-          side: openTrade.side === 'LONG' ? 'LONG' : 'SHORT',
+          side: openTrade.side === 'SHORT' ? 'SHORT' : 'LONG',
           entryPrice: openTrade.entryPrice,
           stopLoss: openTrade.stopLoss,
         });
         this.logCycle(symbol, signal);
         if (signal?.action === 'EXIT') {
-          await this.exitPosition(openTrade, signal.price, lastCandle.closeTime, 'SIGNAL', mode, symbol);
+          await this.exitPosition(openTrade, signal.price, lastCandle.closeTime, 'SIGNAL', mode, symbol, signal.reason);
           openTrade = null;
         }
       }
@@ -100,13 +106,13 @@ export class ExecutionService {
     if (!openTrade) {
       const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, null);
       this.logCycle(symbol, signal);
-      if (signal && (signal.action === 'ENTER_LONG' || signal.action === 'ENTER_SHORT')) {
+      if (signal && sideFromSignal(signal.action)) {
         await this.tryEnter(signal, symbol, mode, lastCandle);
       }
     }
   }
 
-  /** Logs signal=HOLD/ENTER_LONG/EXIT/SKIP + reason every cycle, not just entries/exits. */
+  /** Logs signal=HOLD/ENTER_LONG/ENTER_SHORT/EXIT/SKIP + reason every cycle, not just entries/exits. */
   private logCycle(symbol: string, signal: Signal | null): void {
     if (!signal) {
       const reason = 'strategy evaluation failed or not enough candle history yet';
@@ -128,6 +134,7 @@ export class ExecutionService {
   }
 
   private async tryEnter(signal: Signal, symbol: string, mode: TradeMode, lastCandle: Candle): Promise<void> {
+    const side = sideFromSignal(signal.action)!;
     const riskCtx = await this.riskContextBuilder.build(
       this.gateway,
       symbol,
@@ -139,14 +146,15 @@ export class ExecutionService {
     await this.signalsService.record(signal, decision, mode);
 
     if (!decision.approved || !decision.qty) {
-      this.logger.warn(`Cycle ${symbol}: entry rejected by risk (${decision.rejectReason})`);
+      this.logger.warn(`Cycle ${symbol}: ${side} entry rejected by risk (${decision.rejectReason})`);
       return;
     }
 
+    const orderSide = entryOrderSide(side);
     const entryClientOrderId = generateClientOrderId(mode, symbol, lastCandle.closeTime, 'ENTRY');
     const entryOrder = await this.gateway.placeOrder({
       symbol,
-      side: 'BUY',
+      side: orderSide,
       type: 'MARKET',
       quantity: decision.qty,
       newClientOrderId: entryClientOrderId,
@@ -155,8 +163,10 @@ export class ExecutionService {
 
     const tradeDoc = await this.tradesService.openPosition({
       symbol,
-      side: 'LONG',
+      side,
       strategy: signal.strategy,
+      timeframe: this.strategyConfig.timeframe,
+      entryReason: signal.reason,
       mode,
       entryPrice,
       qty: decision.qty,
@@ -173,7 +183,7 @@ export class ExecutionService {
       clientOrderId: entryClientOrderId,
       binanceOrderId: entryOrder.orderId,
       type: 'MARKET',
-      side: 'BUY',
+      side: orderSide,
       price: entryPrice,
       qty: entryOrder.origQty,
       executedQty: entryOrder.executedQty,
@@ -183,37 +193,53 @@ export class ExecutionService {
     });
 
     this.logger.log(
-      `Entered ${symbol} @ ${entryPrice} stop=${signal.stopLoss} tp=${signal.takeProfit ?? 'n/a'} qty=${decision.qty}`,
+      `Entered ${side} ${symbol} @ ${entryPrice} stop=${signal.stopLoss} tp=${signal.takeProfit ?? 'n/a'} qty=${decision.qty}`,
     );
-    this.eventEmitter.emit('trade.opened', {
-      symbol,
-      side: 'LONG',
-      qty: decision.qty,
-      entryPrice,
-      stopLoss: signal.stopLoss,
-      mode,
-    });
+    this.eventEmitter.emit(
+      TRADE_OPENED,
+      buildTradeOpenedEvent({
+        _id: tradeDoc._id,
+        symbol,
+        side,
+        mode,
+        strategy: signal.strategy,
+        timeframe: this.strategyConfig.timeframe,
+        qty: decision.qty,
+        entryPrice,
+        stopLoss: signal.stopLoss!,
+        takeProfit: signal.takeProfit,
+        entryTime: new Date(lastCandle.closeTime),
+        entryReason: signal.reason,
+      }),
+    );
 
     if (this.gateway.kind === 'BINANCE') {
-      await this.placeStopOrRescue(tradeDoc, symbol, decision.qty, signal.stopLoss!, mode, lastCandle);
+      await this.placeStopOrRescue(tradeDoc, symbol, side, decision.qty, signal.stopLoss!, mode, lastCandle);
     }
   }
 
   private async placeStopOrRescue(
     tradeDoc: TradeDocument,
     symbol: string,
+    side: TradeSide,
     qty: number,
     stopLoss: number,
     mode: TradeMode,
     lastCandle: Candle,
   ): Promise<void> {
     const stopClientOrderId = generateClientOrderId(mode, symbol, lastCandle.closeTime, 'STOP');
-    const limitPrice = stopLoss * (1 - this.config.stopLimitOffsetPct);
+    const stopSide = exitOrderSide(side);
+    // The limit sits past the trigger in the direction of the stop, so it fills once triggered:
+    // below it for a long's SELL stop, above it for a short's BUY stop.
+    const limitPrice =
+      side === 'SHORT'
+        ? stopLoss * (1 + this.config.stopLimitOffsetPct)
+        : stopLoss * (1 - this.config.stopLimitOffsetPct);
 
     try {
       const stopOrder = await this.gateway.placeOrder({
         symbol,
-        side: 'SELL',
+        side: stopSide,
         type: 'STOP_LOSS_LIMIT',
         quantity: qty,
         price: limitPrice,
@@ -226,7 +252,7 @@ export class ExecutionService {
         clientOrderId: stopClientOrderId,
         binanceOrderId: stopOrder.orderId,
         type: 'STOP_LOSS_LIMIT',
-        side: 'SELL',
+        side: stopSide,
         price: limitPrice,
         qty,
         executedQty: 0,
@@ -241,22 +267,18 @@ export class ExecutionService {
       const emergencyClientOrderId = generateClientOrderId(mode, symbol, Date.now(), 'EXIT');
       const emergencyOrder = await this.gateway.placeOrder({
         symbol,
-        side: 'SELL',
+        side: stopSide,
         type: 'MARKET',
         quantity: qty,
         newClientOrderId: emergencyClientOrderId,
       });
-      const exitPrice = emergencyOrder.price || tradeDoc.entryPrice;
-      const pnl = (exitPrice - tradeDoc.entryPrice) * qty;
-      await this.tradesService.closePosition(String(tradeDoc._id), {
-        exitPrice,
+      const closed = await this.tradesService.settlePosition(tradeDoc, {
+        exitPrice: emergencyOrder.price || tradeDoc.entryPrice,
         exitTime: new Date(),
-        fees: 0,
-        pnl,
-        pnlPct: ((exitPrice - tradeDoc.entryPrice) / tradeDoc.entryPrice) * 100,
         exitReason: 'MANUAL',
+        reasonDetail: 'stop order could not be placed',
       });
-      await this.afterTradeClosed(symbol, mode, pnl, 'MANUAL');
+      await this.afterTradeClosed(closed);
     }
   }
 
@@ -267,6 +289,7 @@ export class ExecutionService {
     reason: TradeExitReason,
     mode: TradeMode,
     symbol: string,
+    reasonDetail?: string,
   ): Promise<void> {
     if (this.gateway.kind === 'BINANCE') {
       const openOrders = await this.ordersService.findByTradeId(trade._id);
@@ -283,24 +306,21 @@ export class ExecutionService {
     const clientOrderId = generateClientOrderId(mode, symbol, closeTime, 'EXIT');
     const order = await this.gateway.placeOrder({
       symbol,
-      side: 'SELL',
+      side: exitOrderSide(trade.side),
       type: 'MARKET',
       quantity: trade.qty,
       newClientOrderId: clientOrderId,
     });
     const finalExitPrice = order.price || exitPrice;
-    const pnl = (finalExitPrice - trade.entryPrice) * trade.qty;
 
-    await this.tradesService.closePosition(String(trade._id), {
+    const closed = await this.tradesService.settlePosition(trade, {
       exitPrice: finalExitPrice,
       exitTime: new Date(closeTime),
-      fees: 0,
-      pnl,
-      pnlPct: ((finalExitPrice - trade.entryPrice) / trade.entryPrice) * 100,
       exitReason: reason,
+      reasonDetail,
     });
-    this.logger.log(`Exited ${symbol} @ ${finalExitPrice} (${reason})`);
-    await this.afterTradeClosed(symbol, mode, pnl, reason);
+    this.logger.log(`Exited ${trade.side} ${symbol} @ ${finalExitPrice} (${reason}) pnl=${closed.pnl.toFixed(2)}`);
+    await this.afterTradeClosed(closed);
   }
 
   private async closePaperPosition(
@@ -311,37 +331,28 @@ export class ExecutionService {
   ): Promise<void> {
     await this.gateway.placeOrder({
       symbol: trade.symbol,
-      side: 'SELL',
+      side: exitOrderSide(trade.side),
       type: 'MARKET',
       quantity: trade.qty,
       newClientOrderId: generateClientOrderId('PAPER', trade.symbol, closeTime, 'EXIT'),
     });
-    const pnl = (exitPrice - trade.entryPrice) * trade.qty;
-    await this.tradesService.closePosition(String(trade._id), {
+    const closed = await this.tradesService.settlePosition(trade, {
       exitPrice,
       exitTime: new Date(closeTime),
-      fees: 0,
-      pnl,
-      pnlPct: ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100,
       exitReason: reason,
     });
-    this.logger.log(`Exited ${trade.symbol} @ ${exitPrice} (${reason})`);
-    await this.afterTradeClosed(trade.symbol, 'PAPER', pnl, reason);
+    this.logger.log(`Exited ${trade.side} ${trade.symbol} @ ${exitPrice} (${reason}) pnl=${closed.pnl.toFixed(2)}`);
+    await this.afterTradeClosed(closed);
   }
 
   /** Emits the trade.closed domain event and auto-pauses the bot if risk thresholds are breached. */
-  private async afterTradeClosed(
-    symbol: string,
-    mode: TradeMode,
-    pnl: number,
-    reason: TradeExitReason,
-  ): Promise<void> {
-    this.eventEmitter.emit('trade.closed', { symbol, pnl, reason, mode });
+  private async afterTradeClosed(closed: TradeClosedEvent): Promise<void> {
+    this.eventEmitter.emit(TRADE_CLOSED, closed);
 
     const ctx = await this.riskContextBuilder.build(
       this.gateway,
-      symbol,
-      mode,
+      closed.symbol,
+      closed.mode,
       QUOTE_ASSET,
       this.reconciliation.isOk(),
     );

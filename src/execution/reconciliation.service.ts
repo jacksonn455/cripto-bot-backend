@@ -6,7 +6,9 @@ import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import { generateClientOrderId } from './client-order-id.util';
 import { OrdersService } from '../trades/orders.service';
+import { exitOrderSide } from '../trades/position-math.util';
 import type { TradeMode } from '../trades/schemas/trade.schema';
+import { TRADE_CLOSED } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
 
 /**
@@ -108,15 +110,11 @@ export class ReconciliationService implements OnModuleInit, OnModuleDestroy {
     if (!trade || trade.status !== 'OPEN') return;
 
     if (realStatus.status === 'FILLED') {
-      const pnl = (realStatus.price - trade.entryPrice) * trade.qty;
-      await this.tradesService.closePosition(String(localOrder.tradeId), {
-        exitPrice: realStatus.price,
-        exitTime: new Date(),
-        fees: 0,
-        pnl,
-        pnlPct: ((realStatus.price - trade.entryPrice) / trade.entryPrice) * 100,
-        exitReason: 'SL',
-      });
+      const closed = await this.tradesService.settlePosition(
+        { ...trade, _id: String(localOrder.tradeId) },
+        { exitPrice: realStatus.price, exitTime: new Date(), exitReason: 'SL', reasonDetail: 'stop order filled on the exchange' },
+      );
+      this.eventEmitter.emit(TRADE_CLOSED, closed);
       this.logger.log(`Reconciliation: stop fill detected for ${localOrder.symbol}, trade closed`);
       return;
     }
@@ -130,20 +128,21 @@ export class ReconciliationService implements OnModuleInit, OnModuleDestroy {
       const clientOrderId = generateClientOrderId(mode, localOrder.symbol, Date.now(), 'EXIT');
       const marketOrder = await this.gateway.placeOrder({
         symbol: localOrder.symbol,
-        side: 'SELL',
+        side: exitOrderSide(trade.side),
         type: 'MARKET',
         quantity: trade.qty,
         newClientOrderId: clientOrderId,
       });
-      const exitPrice = marketOrder.price || trade.entryPrice;
-      await this.tradesService.closePosition(String(localOrder.tradeId), {
-        exitPrice,
-        exitTime: new Date(),
-        fees: 0,
-        pnl: (exitPrice - trade.entryPrice) * trade.qty,
-        pnlPct: ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100,
-        exitReason: 'MANUAL',
-      });
+      const closed = await this.tradesService.settlePosition(
+        { ...trade, _id: String(localOrder.tradeId) },
+        {
+          exitPrice: marketOrder.price || trade.entryPrice,
+          exitTime: new Date(),
+          exitReason: 'MANUAL',
+          reasonDetail: `stop order ${realStatus.status} without filling`,
+        },
+      );
+      this.eventEmitter.emit(TRADE_CLOSED, closed);
     }
   }
 }

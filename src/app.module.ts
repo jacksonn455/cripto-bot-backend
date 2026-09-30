@@ -6,6 +6,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { LoggerModule } from 'nestjs-pino';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AiModule } from './ai/ai.module';
 import { AppConfigModule } from './config/app-config.module';
 import { CacheModule } from './cache/cache.module';
 import { ControlModule } from './control/control.module';
@@ -54,6 +55,7 @@ import { TradesModule } from './trades/trades.module';
     EventsModule,
     FundingModule,
     HealthModule,
+    AiModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

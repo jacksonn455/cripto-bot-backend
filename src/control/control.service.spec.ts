@@ -1,3 +1,4 @@
+import { TradesService } from '../trades/trades.service';
 import { ControlService } from './control.service';
 
 function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } = {}) {
@@ -36,6 +37,10 @@ function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } 
   const tradesService = {
     findAllOpen: jest.fn().mockResolvedValue(overrides.openTrades ?? []),
     closePosition: jest.fn().mockResolvedValue(undefined),
+    // Real settlement math on top of the mocked persistence.
+    settlePosition(...args: Parameters<TradesService['settlePosition']>) {
+      return TradesService.prototype.settlePosition.apply(this as never, args);
+    },
   };
 
   const eventEmitter = { emit: jest.fn() };
@@ -141,5 +146,20 @@ describe('ControlService', () => {
       'alert.critical',
       expect.objectContaining({ message: expect.stringContaining('Kill switch triggered') }),
     );
+  });
+
+  it('kill switch flattens a SHORT with a BUY and books a direction-aware pnl + trade.closed', async () => {
+    const openTrades = [{ _id: 't2', symbol: 'BTCUSDT', side: 'SHORT', mode: 'PAPER', qty: 2, entryPrice: 100, entryTime: new Date(0) }];
+    const { service, gateway, tradesService, eventEmitter } = makeDeps({ openTrades });
+
+    await service.killSwitch();
+
+    expect(gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'BUY', quantity: 2 }));
+    // Bought back at 95 after shorting at 100: +10.
+    expect(tradesService.closePosition).toHaveBeenCalledWith(
+      't2',
+      expect.objectContaining({ exitReason: 'KILL_SWITCH', exitPrice: 95, pnl: 10, pnlPct: 5 }),
+    );
+    expect(eventEmitter.emit).toHaveBeenCalledWith('trade.closed', expect.objectContaining({ side: 'SHORT', reason: 'KILL_SWITCH' }));
   });
 });

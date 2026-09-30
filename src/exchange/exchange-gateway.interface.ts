@@ -18,6 +18,11 @@ export type ExchangeGatewayKind = 'BINANCE' | 'PAPER' | 'BACKTEST';
  */
 export interface ExchangeGateway {
   readonly kind: ExchangeGatewayKind;
+  /**
+   * Whether a SELL may open a position without holding the asset (a short). Spot venues can't
+   * borrow, so RiskManager vetoes ENTER_SHORT (SHORT_NOT_SUPPORTED) instead of sending the order.
+   */
+  readonly supportsShortSelling: boolean;
 
   getBalances(): Promise<Balance[]>;
   getBalance(asset: string): Promise<Balance | undefined>;

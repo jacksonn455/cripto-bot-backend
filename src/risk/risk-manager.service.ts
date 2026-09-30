@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { riskConfig } from '../config/configuration';
 import { meetsMinNotional, roundDownToStep } from '../exchange/order-rounding.util';
 import type { Signal } from '../strategy/strategy.interface';
+import { isStopOnLosingSide, isTargetOnWinningSide, sideFromSignal } from '../trades/position-math.util';
 import { RejectReason, RiskContext, RiskDecision } from './risk.interface';
 
 /**
@@ -17,13 +18,17 @@ export class RiskManagerService {
   ) {}
 
   evaluate(signal: Signal, ctx: RiskContext): RiskDecision {
-    if (signal.action !== 'ENTER_LONG' && signal.action !== 'ENTER_SHORT') {
+    const side = sideFromSignal(signal.action);
+    if (!side) {
       // Risk only gates new entries; exits/no-action pass straight through to execution.
       return { approved: true };
     }
 
     if (ctx.isPaused) return this.reject('BOT_PAUSED');
     if (!ctx.reconciliationOk) return this.reject('RECONCILIATION_FAILED');
+    // Never send a naked SELL to a venue that can't borrow: on Binance Spot it would just fail
+    // (insufficient balance) or, worse, sell coins the account holds for another reason.
+    if (side === 'SHORT' && ctx.shortSellingSupported !== true) return this.reject('SHORT_NOT_SUPPORTED');
 
     if (ctx.dailyPnl <= -this.config.maxDailyLossPct * ctx.accountEquity) {
       return this.reject('DAILY_LOSS_LIMIT');
@@ -36,10 +41,15 @@ export class RiskManagerService {
     }
 
     if (signal.stopLoss === undefined) return this.reject('MISSING_STOP_LOSS');
+    // A stop on the wrong side (e.g. above a long's entry) would "limit" a profit, not a loss.
+    if (!isStopOnLosingSide(side, signal.price, signal.stopLoss)) return this.reject('INVALID_STOP_DISTANCE');
     const riskPerUnit = Math.abs(signal.price - signal.stopLoss);
     if (riskPerUnit <= 0) return this.reject('INVALID_STOP_DISTANCE');
 
     if (signal.takeProfit !== undefined) {
+      if (!isTargetOnWinningSide(side, signal.price, signal.takeProfit)) {
+        return this.reject('INVALID_TAKE_PROFIT');
+      }
       const reward = Math.abs(signal.takeProfit - signal.price);
       if (reward / riskPerUnit < this.config.minRiskRewardRatio) {
         return this.reject('RR_TOO_LOW');

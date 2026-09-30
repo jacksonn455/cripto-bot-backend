@@ -29,6 +29,11 @@ export class GetTradesQueryDto {
   @IsString()
   strategy?: string;
 
+  @ApiPropertyOptional({ enum: ['LONG', 'SHORT'] })
+  @IsOptional()
+  @IsIn(['LONG', 'SHORT'])
+  side?: 'LONG' | 'SHORT';
+
   @ApiPropertyOptional({ enum: ['OPEN', 'CLOSED'] })
   @IsOptional()
   @IsIn(['OPEN', 'CLOSED'])

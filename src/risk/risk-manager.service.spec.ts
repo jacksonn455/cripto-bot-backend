@@ -184,4 +184,71 @@ describe('RiskManagerService', () => {
     );
     expect(decision).toEqual({ approved: false, rejectReason: 'MIN_NOTIONAL_NOT_MET' });
   });
+
+  describe('short entries', () => {
+    const shortSignal = (overrides: Partial<Signal> = {}) =>
+      makeSignal({ action: 'ENTER_SHORT', price: 100, stopLoss: 105, takeProfit: 90, ...overrides });
+
+    it('approves a valid short and sizes qty from the distance to a stop ABOVE the entry', () => {
+      const decision = risk.evaluate(shortSignal(), makeContext({ shortSellingSupported: true }));
+      // riskAmount = 100; riskPerUnit = 105 - 100 = 5; qty = 20, same as the mirrored long.
+      expect(decision).toEqual({ approved: true, qty: 20 });
+    });
+
+    it('rejects shorts on a venue that cannot short (Binance Spot) instead of sending a naked SELL', () => {
+      expect(risk.evaluate(shortSignal(), makeContext())).toEqual({ approved: false, rejectReason: 'SHORT_NOT_SUPPORTED' });
+      expect(risk.evaluate(shortSignal(), makeContext({ shortSellingSupported: false }))).toEqual({
+        approved: false,
+        rejectReason: 'SHORT_NOT_SUPPORTED',
+      });
+    });
+
+    it('rejects a short whose stop is below the entry (it would never cap the loss)', () => {
+      const decision = risk.evaluate(shortSignal({ stopLoss: 95 }), makeContext({ shortSellingSupported: true }));
+      expect(decision).toEqual({ approved: false, rejectReason: 'INVALID_STOP_DISTANCE' });
+    });
+
+    it('rejects a short whose take profit is above the entry', () => {
+      const decision = risk.evaluate(shortSignal({ takeProfit: 110 }), makeContext({ shortSellingSupported: true }));
+      expect(decision).toEqual({ approved: false, rejectReason: 'INVALID_TAKE_PROFIT' });
+    });
+
+    it('applies the same R:R rule as longs', () => {
+      // reward 5 / risk 5 = 1 < 1.5
+      const decision = risk.evaluate(shortSignal({ takeProfit: 95 }), makeContext({ shortSellingSupported: true }));
+      expect(decision).toEqual({ approved: false, rejectReason: 'RR_TOO_LOW' });
+    });
+
+    it('caps short notional by the per-asset exposure limit, like longs', () => {
+      // riskPerUnit 0.5 -> qty 200 (notional 20k) capped to 30% of 10k = 3000 -> qty 30.
+      const decision = risk.evaluate(
+        shortSignal({ stopLoss: 100.5, takeProfit: 90 }),
+        makeContext({ shortSellingSupported: true }),
+      );
+      expect(decision).toEqual({ approved: true, qty: 30 });
+    });
+
+    it('still honors pause and daily-loss vetoes', () => {
+      expect(risk.evaluate(shortSignal(), makeContext({ isPaused: true, shortSellingSupported: true })).rejectReason).toBe(
+        'BOT_PAUSED',
+      );
+      expect(
+        risk.evaluate(shortSignal(), makeContext({ dailyPnl: -300, shortSellingSupported: true })).rejectReason,
+      ).toBe('DAILY_LOSS_LIMIT');
+    });
+  });
+
+  it('rejects a long whose stop is above the entry (previously accepted via Math.abs)', () => {
+    expect(risk.evaluate(makeSignal({ stopLoss: 105 }), makeContext())).toEqual({
+      approved: false,
+      rejectReason: 'INVALID_STOP_DISTANCE',
+    });
+  });
+
+  it('rejects a long whose take profit is below the entry', () => {
+    expect(risk.evaluate(makeSignal({ takeProfit: 90 }), makeContext())).toEqual({
+      approved: false,
+      rejectReason: 'INVALID_TAKE_PROFIT',
+    });
+  });
 });

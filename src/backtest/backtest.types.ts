@@ -8,6 +8,12 @@ export interface BacktestParams {
   feesPct: number;
   /** Fraction applied unfavorably to entry/exit fills. */
   slippagePct: number;
+  /**
+   * Carry cost of holding a short, as a fraction of the entry notional per day held (borrow
+   * interest on margin, or average funding paid on perpetuals). Charged as a fee at exit.
+   * 0/omitted = not modeled.
+   */
+  shortBorrowPctPerDay?: number;
   symbolFilters?: {
     stepSize: number;
     minQty: number;
@@ -33,7 +39,12 @@ export interface SimulatedTrade {
   qty: number;
   entryTime: number;
   exitTime: number;
+  /** Exchange fees plus, for shorts, the modeled carry cost. Already subtracted from pnl. */
   fees: number;
+  /** Part of `fees` that is short carry cost (0 for longs). */
+  carryCost: number;
+  /** Quote amount lost to slippage on entry + exit (already reflected in the fill prices). */
+  slippageCost: number;
   pnl: number;
   pnlPct: number;
   stopLoss: number;

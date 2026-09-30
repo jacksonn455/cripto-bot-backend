@@ -31,14 +31,27 @@ const PARAM_SPEC: ReadonlyArray<StrategyParamSpec & { key: NumericKey }> = [
   { key: 'atrStopMultiplier', description: 'Stop = entrada − N × ATR', min: 0.1, max: 20, integer: false },
   { key: 'chandelierLookback', description: 'Trailing: janela da máxima (candles)', min: 2, max: 500, integer: true },
   { key: 'chandelierAtrMultiplier', description: 'Trailing: máxima − N × ATR', min: 0.1, max: 20, integer: false },
+  {
+    key: 'allowShort',
+    description: 'Entradas Short (espelho das regras Long): 0 = desligado, 1 = ligado',
+    min: 0,
+    max: 1,
+    integer: true,
+  },
 ];
 
 /**
- * Trend following with a higher-timeframe regime filter.
- * Regime: close > EMA200 (on regimeCandles). Entry: EMA fast crosses above EMA slow AND
+ * Trend following with a higher-timeframe regime filter, symmetric for both directions.
+ *
+ * LONG — regime: close > EMA200 (on regimeCandles). Entry: EMA fast crosses above EMA slow AND
  * RSI in [rsiMin, rsiMax]. Stop: entry - atrStopMultiplier*ATR. Exit: EMA fast crosses back
  * below EMA slow, or a chandelier-style ATR trailing stop over a rolling lookback window
  * (a v1 simplification of "highest high since entry", since the strategy itself is stateless).
+ *
+ * SHORT (only when allowShort=1) — the exact mirror, with no extra tunable parameters:
+ * regime close < EMA200, EMA fast crosses below EMA slow, RSI in [100-rsiMax, 100-rsiMin]
+ * (the long band reflected around 50), stop entry + N*ATR, exit on the cross back up or when
+ * close rises above lowest low + chandelierAtrMultiplier*ATR.
  */
 @Injectable()
 export class TrendRegimeStrategy implements Strategy {
@@ -48,11 +61,11 @@ export class TrendRegimeStrategy implements Strategy {
   constructor(
     private readonly indicators: IndicatorsService,
     @Inject(trendRegimeConfig.KEY)
-    private readonly config: TrendRegimeConfig,
+    private readonly config: Omit<TrendRegimeConfig, 'allowShort'> & { allowShort?: number },
   ) {}
 
   getParams(): Record<string, number> {
-    return Object.fromEntries(PARAM_SPEC.map((p) => [p.key, this.config[p.key]]));
+    return Object.fromEntries(PARAM_SPEC.map((p) => [p.key, this.config[p.key] ?? 0]));
   }
 
   withParams(overrides: Record<string, unknown>): TrendRegimeStrategy {
@@ -62,6 +75,10 @@ export class TrendRegimeStrategy implements Strategy {
     if (merged.rsiMin >= merged.rsiMax) problems.push('rsiMin must be lower than rsiMax');
     if (problems.length) throw new StrategyParamsError(problems);
     return new TrendRegimeStrategy(this.indicators, { ...this.config, ...merged });
+  }
+
+  private get shortEnabled(): boolean {
+    return this.config.allowShort === 1;
   }
 
   onCandleClosed(ctx: StrategyContext): Signal {
@@ -90,6 +107,7 @@ export class TrendRegimeStrategy implements Strategy {
     const lastRegimeClose = regimeCloses[regimeCloses.length - 1];
     const lastEmaRegime = emaRegime[emaRegime.length - 1];
     const regimeIsUp = lastEmaRegime !== undefined && lastRegimeClose > lastEmaRegime;
+    const regimeIsDown = lastEmaRegime !== undefined && lastRegimeClose < lastEmaRegime;
 
     const indicatorsSnapshot: Record<string, number | undefined> = {
       emaFast: emaFast[i],
@@ -113,11 +131,12 @@ export class TrendRegimeStrategy implements Strategy {
       return this.none(symbol, last, indicatorsSnapshot, 'Posição aberta, sem gatilho de saída');
     }
 
-    const crossedUp = this.crossedAbove(emaFast, emaSlow, i);
     const rsiValue = rsi[i];
+    const atrValue = atr[i];
+
+    const crossedUp = this.crossedAbove(emaFast, emaSlow, i);
     const rsiOk =
       rsiValue !== undefined && rsiValue >= this.config.rsiMin && rsiValue <= this.config.rsiMax;
-    const atrValue = atr[i];
 
     if (regimeIsUp && crossedUp && rsiOk && atrValue !== undefined) {
       const stopLoss = last.close - this.config.atrStopMultiplier * atrValue;
@@ -137,12 +156,41 @@ export class TrendRegimeStrategy implements Strategy {
       };
     }
 
+    const [shortRsiMin, shortRsiMax] = this.shortRsiBand();
+    const crossedDown = this.crossedBelow(emaFast, emaSlow, i);
+    const shortRsiOk = rsiValue !== undefined && rsiValue >= shortRsiMin && rsiValue <= shortRsiMax;
+
+    if (this.shortEnabled && regimeIsDown && crossedDown && shortRsiOk && atrValue !== undefined) {
+      const stopLoss = last.close + this.config.atrStopMultiplier * atrValue;
+      return {
+        action: 'ENTER_SHORT',
+        symbol,
+        strategy: this.name,
+        candleTime: last.closeTime,
+        price: last.close,
+        stopLoss,
+        indicators: indicatorsSnapshot,
+        reason:
+          `EMA${this.config.emaFast} cruzou abaixo da EMA${this.config.emaSlow}, ` +
+          `RSI(${this.config.rsiPeriod})=${rsiValue.toFixed(1)} dentro de ` +
+          `[${shortRsiMin},${shortRsiMax}], regime de baixa ` +
+          `(close < EMA${this.config.emaRegime})`,
+      };
+    }
+
     return this.none(
       symbol,
       last,
       indicatorsSnapshot,
-      this.explainNoEntry(regimeIsUp, crossedUp, rsiOk),
+      this.shortEnabled && !regimeIsUp
+        ? this.explainNoShortEntry(regimeIsDown, crossedDown, shortRsiOk)
+        : this.explainNoEntry(regimeIsUp, crossedUp, rsiOk),
     );
+  }
+
+  /** The long RSI band reflected around 50: [45, 70] for longs becomes [30, 55] for shorts. */
+  private shortRsiBand(): [number, number] {
+    return [100 - this.config.rsiMax, 100 - this.config.rsiMin];
   }
 
   private checkExit(
@@ -154,12 +202,16 @@ export class TrendRegimeStrategy implements Strategy {
     i: number,
   ): Pick<Signal, 'action' | 'price' | 'reason'> | null {
     const last = candles[i];
+    const isShort = position.side === 'SHORT';
 
-    if (this.crossedBelow(emaFast, emaSlow, i)) {
+    const trendReversed = isShort
+      ? this.crossedAbove(emaFast, emaSlow, i)
+      : this.crossedBelow(emaFast, emaSlow, i);
+    if (trendReversed) {
       return {
         action: 'EXIT',
         price: last.close,
-        reason: `EMA${this.config.emaFast} cruzou abaixo da EMA${this.config.emaSlow}`,
+        reason: `EMA${this.config.emaFast} cruzou ${isShort ? 'acima' : 'abaixo'} da EMA${this.config.emaSlow}`,
       };
     }
 
@@ -167,18 +219,29 @@ export class TrendRegimeStrategy implements Strategy {
     if (atrValue !== undefined) {
       const from = Math.max(0, i - this.config.chandelierLookback + 1);
       const lookback = candles.slice(from, i + 1);
-      const highestHigh = Math.max(...lookback.map((c) => c.high));
-      const trailingStop = highestHigh - this.config.chandelierAtrMultiplier * atrValue;
-      if (last.close < trailingStop) {
-        return {
-          action: 'EXIT',
-          price: last.close,
-          reason: `Chandelier exit: close ${last.close} < trailing stop ${trailingStop.toFixed(2)}`,
-        };
+      if (isShort) {
+        const lowestLow = Math.min(...lookback.map((c) => c.low));
+        const trailingStop = lowestLow + this.config.chandelierAtrMultiplier * atrValue;
+        if (last.close > trailingStop) {
+          return {
+            action: 'EXIT',
+            price: last.close,
+            reason: `Chandelier exit (short): close ${last.close} > trailing stop ${trailingStop.toFixed(2)}`,
+          };
+        }
+      } else {
+        const highestHigh = Math.max(...lookback.map((c) => c.high));
+        const trailingStop = highestHigh - this.config.chandelierAtrMultiplier * atrValue;
+        if (last.close < trailingStop) {
+          return {
+            action: 'EXIT',
+            price: last.close,
+            reason: `Chandelier exit: close ${last.close} < trailing stop ${trailingStop.toFixed(2)}`,
+          };
+        }
       }
     }
 
-    void position; // reserved for future use (e.g. breakeven rules based on entryPrice)
     return null;
   }
 
@@ -230,6 +293,15 @@ export class TrendRegimeStrategy implements Strategy {
     if (!regimeIsUp) reasons.push('regime nao esta em alta');
     if (!crossedUp) reasons.push('sem cruzamento EMA rapida/lenta');
     if (!rsiOk) reasons.push('RSI fora da faixa');
+    return reasons.length ? reasons.join('; ') : 'sem condicao de entrada';
+  }
+
+  /** Used when shorts are enabled and the regime is not up (so the long side can't trigger anyway). */
+  private explainNoShortEntry(regimeIsDown: boolean, crossedDown: boolean, rsiOk: boolean): string {
+    const reasons: string[] = [];
+    if (!regimeIsDown) reasons.push('regime indefinido (nem alta nem baixa)');
+    if (!crossedDown) reasons.push('short: sem cruzamento EMA rapida abaixo da lenta');
+    if (!rsiOk) reasons.push('short: RSI fora da faixa');
     return reasons.length ? reasons.join('; ') : 'sem condicao de entrada';
   }
 }

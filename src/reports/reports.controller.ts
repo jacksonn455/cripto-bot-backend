@@ -39,6 +39,12 @@ export class ReportsController {
     return this.reports.bySymbol(query, query.page, query.limit);
   }
 
+  @Get('by-side')
+  @ApiOperation({ summary: 'Aggregated performance grouped by side (LONG vs SHORT)' })
+  bySide(@Query() query: PaginatedReportsFilterQueryDto) {
+    return this.reports.bySide(query, query.page, query.limit);
+  }
+
   @Get('by-hour')
   @ApiOperation({ summary: 'Aggregated performance by hour of day and day of week (exit time, in `tz`)' })
   byHour(@Query() query: ByHourQueryDto) {
@@ -57,6 +63,7 @@ export class ReportsController {
     return this.reports.compareModes({
       symbol: query.symbol,
       strategy: query.strategy,
+      side: query.side,
       from: query.from,
       to: query.to,
       dateField: query.dateField,

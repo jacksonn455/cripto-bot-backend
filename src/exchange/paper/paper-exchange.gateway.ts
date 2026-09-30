@@ -16,10 +16,13 @@ import type { PaperBalanceStore } from './paper-balance.store';
  * (tests) they live in memory only.
  * Order fill simulation here is intentionally simple (instant fill at last close for
  * MARKET orders); the backtest/execution phases will refine slippage and resting orders.
+ * Shorts are simulated as a plain negative base balance (sell first, buy back later): no borrow
+ * interest, funding or liquidation is modeled, so paper shorts look slightly better than real ones.
  */
 @Injectable()
 export class PaperExchangeGateway implements ExchangeGateway {
   readonly kind: ExchangeGatewayKind = 'PAPER';
+  readonly supportsShortSelling = true;
 
   private readonly logger = new Logger(PaperExchangeGateway.name);
   private readonly marketDataClient: BinanceRestClient;

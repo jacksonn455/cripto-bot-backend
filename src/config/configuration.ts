@@ -46,6 +46,9 @@ export const trendRegimeConfig = registerAs('trendRegime', () => ({
   // Chandelier exit lookback (candles) and ATR multiplier for the trailing stop.
   chandelierLookback: parseInt(process.env.TREND_CHANDELIER_LOOKBACK ?? '22', 10),
   chandelierAtrMultiplier: parseFloat(process.env.TREND_CHANDELIER_ATR_MULT ?? '3'),
+  // 1 = the strategy also emits ENTER_SHORT (mirror of the long rules). A number, not a boolean,
+  // so backtests can override it through strategyParams like any other knob. Off by default.
+  allowShort: process.env.TREND_ALLOW_SHORT === 'true' ? 1 : 0,
 }));
 
 export const riskConfig = registerAs('risk', () => ({
@@ -81,9 +84,28 @@ export const controlConfig = registerAs('control', () => ({
   requireKeyForAllRoutes: process.env.API_KEY_REQUIRED_FOR_ALL === 'true',
 }));
 
+/** Which domain events a channel receives: `alerts` (critical/pause/resume) and/or `trades` (open/close). */
+export type NotificationCategory = 'alerts' | 'trades';
+
+function parseCategories(raw: string | undefined, fallback: string): NotificationCategory[] {
+  return (raw ?? fallback)
+    .split(',')
+    .map((c) => c.trim().toLowerCase())
+    .filter((c): c is NotificationCategory => c === 'alerts' || c === 'trades');
+}
+
 export const notificationsConfig = registerAs('notifications', () => ({
+  // Telegram keeps its original behavior: on as soon as token + chat id exist, alerts only.
+  telegramEnabled: process.env.TELEGRAM_ENABLED !== 'false',
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID ?? '',
+  telegramEvents: parseCategories(process.env.TELEGRAM_EVENTS, 'alerts'),
+  discordEnabled: process.env.DISCORD_ENABLED === 'true',
+  discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL ?? '',
+  discordUsername: process.env.DISCORD_USERNAME ?? 'Trade Bot',
+  discordEvents: parseCategories(process.env.DISCORD_EVENTS, 'alerts,trades'),
+  // Per HTTP attempt; a slow chat API can never hold a trade cycle (delivery is fire-and-forget anyway).
+  timeoutMs: parseInt(process.env.NOTIFICATIONS_TIMEOUT_MS ?? '5000', 10),
 }));
 
 export const fundingConfig = registerAs('funding', () => ({
@@ -94,7 +116,31 @@ export const fundingConfig = registerAs('funding', () => ({
 }));
 
 export const redisConfig = registerAs('redis', () => ({
+  // false = cache off even with a REDIS_URL (same effect as REDIS_URL=): reports read Mongo directly.
+  enabled: process.env.REDIS_ENABLED !== 'false',
   url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+  connectTimeoutMs: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS ?? '2000', 10),
+  // A hung Redis costs a request at most this long before falling back to Mongo.
+  commandTimeoutMs: parseInt(process.env.REDIS_COMMAND_TIMEOUT_MS ?? '500', 10),
+  // Reconnect budget (exponential backoff up to 30s) before giving up; then one re-probe every 5 min.
+  maxReconnectAttempts: parseInt(process.env.REDIS_MAX_RECONNECT_ATTEMPTS ?? '10', 10),
   // TTL for cached report/chart queries — short-lived, also actively invalidated on trade events.
   reportsTtlSeconds: parseInt(process.env.REPORTS_CACHE_TTL_SECONDS ?? '30', 10),
+}));
+
+export const openAiConfig = registerAs('openai', () => ({
+  // Analysis/explanation layer only: agents get read-only tools and can never place or close orders.
+  agentsEnabled: process.env.OPENAI_AGENTS_ENABLED === 'true',
+  apiKey: process.env.OPENAI_API_KEY ?? '',
+  // Empty = the Agents SDK default model.
+  model: process.env.OPENAI_MODEL ?? '',
+  // Per HTTP request to OpenAI (the openai client retries 429/5xx up to maxRetries on its own).
+  requestTimeoutMs: parseInt(process.env.OPENAI_REQUEST_TIMEOUT_MS ?? '30000', 10),
+  maxRetries: parseInt(process.env.OPENAI_MAX_RETRIES ?? '2', 10),
+  // Whole agent run (all model calls + tool calls), enforced with an AbortSignal.
+  agentTimeoutMs: parseInt(process.env.OPENAI_AGENT_TIMEOUT_MS ?? '90000', 10),
+  maxTurns: parseInt(process.env.OPENAI_AGENT_MAX_TURNS ?? '8', 10),
+  maxConcurrentRuns: parseInt(process.env.OPENAI_MAX_CONCURRENT_RUNS ?? '2', 10),
+  // Off by default: traces would send prompts and tool outputs (trades, balances) to OpenAI's dashboard.
+  tracingEnabled: process.env.OPENAI_TRACING_ENABLED === 'true',
 }));

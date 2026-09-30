@@ -56,7 +56,20 @@ export class BacktestRun {
 
   /** Trading costs actually charged in the simulation. */
   @Prop({ type: Object })
-  costs?: { totalFees: number; feesPctOfCapital: number };
+  costs?: {
+    totalFees: number;
+    feesPctOfCapital: number;
+    /** Added later: absent on older runs. */
+    totalSlippage?: number;
+    slippagePctOfCapital?: number;
+    /** Short carry (borrow/funding) part of totalFees. */
+    totalShortCarry?: number;
+    shortBorrowPctPerDay?: number;
+  };
+
+  /** Fraction of the simulated candles with an open position (0–1), averaged across symbols. */
+  @Prop()
+  exposurePct?: number;
 
   @Prop({ required: true, default: () => new Date() })
   createdAt: Date;

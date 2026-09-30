@@ -26,6 +26,9 @@ export interface BacktestRunResponse {
   runId: string;
   summary: MetricsSummary;
   tradeCount: number;
+  costs: NonNullable<BacktestRun['costs']>;
+  /** Fraction of the simulated candles with an open position (0–1). */
+  exposurePct: number;
   paramVariationsTestedForStrategy: number;
   walkForwardWindows?: Array<{ from: string; to: string; summary: MetricsSummary; tradeCount: number }>;
 }
@@ -115,6 +118,7 @@ export class BacktestService {
           initialBalance: balances.get(symbol)!,
           feesPct: dto.feesPct,
           slippagePct: dto.slippagePct,
+          shortBorrowPctPerDay: dto.shortBorrowPctPerDay,
           symbolFilters: filters.get(symbol),
           candleLookback: lookback,
           tradeFrom: window.from,
@@ -124,7 +128,7 @@ export class BacktestService {
         const p = prices.get(symbol)!;
         if (p.start === undefined && traded.length) p.start = traded[0].close;
         if (traded.length) p.end = traded[traded.length - 1].close;
-        await this.persistTradesAndSignals(result, runId, dto.strategy);
+        await this.persistTradesAndSignals(result, runId, dto.strategy, dto.timeframe);
         balances.set(symbol, result.finalBalance);
         curves.get(symbol)!.push(...result.equityCurve);
         windowTrades.push(...result.trades);
@@ -151,7 +155,23 @@ export class BacktestService {
     const summary = computeMetrics(allTrades, dto.initialBalance);
     const benchmark = buildBenchmark(prices);
     const totalFees = allTrades.reduce((sum, t) => sum + t.fees, 0);
-    const costs = { totalFees, feesPctOfCapital: dto.initialBalance ? totalFees / dto.initialBalance : 0 };
+    const totalSlippage = allTrades.reduce((sum, t) => sum + t.slippageCost, 0);
+    const totalShortCarry = allTrades.reduce((sum, t) => sum + t.carryCost, 0);
+    const costs = {
+      totalFees,
+      feesPctOfCapital: dto.initialBalance ? totalFees / dto.initialBalance : 0,
+      totalSlippage,
+      slippagePctOfCapital: dto.initialBalance ? totalSlippage / dto.initialBalance : 0,
+      totalShortCarry,
+      shortBorrowPctPerDay: dto.shortBorrowPctPerDay,
+    };
+    const allPoints = [...curves.values()].flat();
+    const exposurePct = allPoints.length
+      ? allPoints.filter((p) => p.openPositions > 0).length / allPoints.length
+      : 0;
+    // allowShort=0 is the pre-short behavior: leaving it out keeps long-only runs hashing exactly as
+    // they did before the knob existed, so the overfitting counter doesn't count them twice.
+    const { allowShort, ...longOnlyParams } = strategyParams;
     const paramsForHash = {
       strategy: dto.strategy,
       symbols: [...symbols].sort(),
@@ -159,9 +179,11 @@ export class BacktestService {
       regimeTimeframe,
       feesPct: dto.feesPct,
       slippagePct: dto.slippagePct,
+      // Only matters when shorts are on; left out otherwise so long-only runs hash as before.
+      ...(allowShort ? { shortBorrowPctPerDay: dto.shortBorrowPctPerDay } : {}),
       initialBalance: dto.initialBalance,
       // Effective values (defaults + overrides), so an explicit default hashes like an omitted one.
-      strategyParams,
+      strategyParams: allowShort ? strategyParams : longOnlyParams,
     };
     const paramsHash = computeParamsHash(paramsForHash);
 
@@ -182,6 +204,7 @@ export class BacktestService {
         : undefined,
       benchmark,
       costs,
+      exposurePct,
     });
 
     const paramVariationsTestedForStrategy = (await this.variationsByStrategy()).get(dto.strategy) ?? 1;
@@ -199,6 +222,8 @@ export class BacktestService {
       runId,
       summary,
       tradeCount: allTrades.length,
+      costs,
+      exposurePct,
       paramVariationsTestedForStrategy,
       walkForwardWindows: dto.walkForward ? walkForwardWindows : undefined,
     };
@@ -274,12 +299,18 @@ export class BacktestService {
     }
   }
 
-  private async persistTradesAndSignals(result: BacktestResult, runId: string, strategy: string): Promise<void> {
+  private async persistTradesAndSignals(
+    result: BacktestResult,
+    runId: string,
+    strategy: string,
+    timeframe: string,
+  ): Promise<void> {
     await this.tradesService.insertMany(
       result.trades.map((t) => ({
         symbol: t.symbol,
         side: t.side,
         strategy,
+        timeframe,
         mode: 'BACKTEST' as const,
         runId,
         entryPrice: t.entryPrice,

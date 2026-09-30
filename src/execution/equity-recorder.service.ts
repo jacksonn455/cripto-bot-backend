@@ -3,6 +3,7 @@ import { executionConfig, tradingConfig } from '../config/configuration';
 import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import { EquitySnapshotsService } from '../reports/equity-snapshots.service';
+import { positionValue } from '../trades/position-math.util';
 import { TradesService } from '../trades/trades.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
@@ -47,9 +48,9 @@ export class EquityRecorderService implements OnModuleInit, OnModuleDestroy {
 
       let positionsValue = 0;
       for (const trade of openTrades) {
-        // v1 is long-only (kill switch/exits always SELL), so position value = qty * price.
+        // Long: holds qty (+qty*price). Short: owes qty back (-qty*price); its sale proceeds are in cash.
         const price = (await this.lastPrice(trade.symbol)) ?? trade.entryPrice;
-        positionsValue += trade.qty * price;
+        positionsValue += positionValue(trade.side ?? 'LONG', trade.qty, price);
       }
 
       await this.equitySnapshots.insertMany([

@@ -97,6 +97,20 @@ export class RunBacktestDto {
   slippagePct: number = 0.0005;
 
   @ApiPropertyOptional({
+    default: 0.0003,
+    description:
+      'Short carry cost per day held, as a fraction of the entry notional (0.0003 = 0.03%/day, ' +
+      '≈ the 0.01%/8h interest component of Binance perpetual funding). Only charged on SHORT ' +
+      'trades; 0 = not modeled.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(0.05)
+  shortBorrowPctPerDay: number = 0.0003;
+
+  @ApiPropertyOptional({
     type: WalkForwardDto,
     description:
       'When set, splits [from,to] into consecutive test windows and reports a result per window ' +
@@ -109,7 +123,8 @@ export class RunBacktestDto {
 
   @ApiPropertyOptional({
     description:
-      'Overrides for the strategy parameters (see GET /strategies), e.g. { "emaFast": 10 }. ' +
+      'Overrides for the strategy parameters (see GET /strategies), e.g. { "emaFast": 10 } or ' +
+      '{ "allowShort": 1 } to compare long-only (baseline) vs long+short. ' +
       'Unspecified ones keep their configured value. Part of the params hash, so each distinct ' +
       'combination counts as one more tested variation.',
     example: { emaFast: 10, emaSlow: 40 },

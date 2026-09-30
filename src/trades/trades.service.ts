@@ -2,7 +2,9 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, QueryFilter, Types } from 'mongoose';
 import { GetTradesQueryDto } from './dto/get-trades-query.dto';
+import { computePnl } from './position-math.util';
 import { Trade, TradeDocument, TradeExitReason, TradeMode } from './schemas/trade.schema';
+import { buildTradeClosedEvent, TradeClosedEvent } from './trade-events';
 
 export interface PaginatedResult<T> {
   items: T[];
@@ -15,7 +17,7 @@ const CSV_COLUMNS = [
   'symbol', 'side', 'strategy', 'mode', 'runId',
   'entryPrice', 'exitPrice', 'qty', 'entryTime', 'exitTime',
   'fees', 'pnl', 'pnlPct', 'stopLoss', 'takeProfit',
-  'status', 'exitReason', 'isSeed',
+  'status', 'exitReason', 'isSeed', 'timeframe',
 ] as const;
 
 @Injectable()
@@ -86,6 +88,24 @@ export class TradesService {
     await this.tradeModel.updateOne({ _id: id }, { $set: { ...data, status: 'CLOSED' } });
   }
 
+  /**
+   * Closes an open trade with direction-aware pnl (LONG and SHORT) and returns the
+   * `trade.closed` event payload for the caller to emit — the single settlement path shared by
+   * execution, reconciliation and the kill switch.
+   */
+  async settlePosition(
+    trade: Pick<Trade, 'symbol' | 'side' | 'mode' | 'strategy' | 'timeframe' | 'qty' | 'entryPrice' | 'stopLoss' | 'takeProfit' | 'entryTime' | 'entryReason'> & {
+      _id: Types.ObjectId | string;
+    },
+    close: { exitPrice: number; exitTime: Date; exitReason: TradeExitReason; fees?: number; reasonDetail?: string },
+  ): Promise<TradeClosedEvent> {
+    const fees = close.fees ?? 0;
+    const { pnl, pnlPct } = computePnl(trade.side, trade.entryPrice, close.exitPrice, trade.qty, fees);
+    const data = { exitPrice: close.exitPrice, exitTime: close.exitTime, fees, pnl, pnlPct, exitReason: close.exitReason };
+    await this.closePosition(trade._id, data);
+    return buildTradeClosedEvent(trade, data, close.reasonDetail);
+  }
+
   async exportCsv(query: GetTradesQueryDto): Promise<string> {
     const filter = this.buildFilter(query);
     const trades = await this.tradeModel
@@ -100,6 +120,7 @@ export class TradesService {
     if (query.mode) filter.mode = query.mode;
     if (query.symbol) filter.symbol = query.symbol.toUpperCase();
     if (query.strategy) filter.strategy = query.strategy;
+    if (query.side) filter.side = query.side;
     if (query.status) filter.status = query.status;
     if (query.runId) filter.runId = query.runId;
     // Real trades have no isSeed field at all, hence $ne rather than false.

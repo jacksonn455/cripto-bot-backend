@@ -1,3 +1,4 @@
+import { TradesService } from '../trades/trades.service';
 import { Candle } from '../exchange/types/candle.type';
 import { ExecutionService } from './execution.service';
 
@@ -32,6 +33,7 @@ function makeDeps(overrides: {
   decision?: unknown;
   openTrade?: unknown;
   candles?: Candle[];
+  fillPrice?: number;
 } = {}) {
   const candles = overrides.candles ?? [candle(1_000, 100, 101, 99)];
   const signal = overrides.signal ?? {
@@ -56,7 +58,7 @@ function makeDeps(overrides: {
       side: 'BUY',
       type: 'MARKET',
       status: 'FILLED',
-      price: 100,
+      price: overrides.fillPrice ?? 100,
       origQty: 1,
       executedQty: 1,
       createdAt: Date.now(),
@@ -73,6 +75,10 @@ function makeDeps(overrides: {
     findOpenPosition: jest.fn().mockResolvedValue(overrides.openTrade ?? null),
     openPosition: jest.fn().mockResolvedValue({ _id: 'trade1', entryPrice: 100 }),
     closePosition: jest.fn().mockResolvedValue(undefined),
+    // Real settlement math on top of the mocked persistence.
+    settlePosition(...args: Parameters<TradesService['settlePosition']>) {
+      return TradesService.prototype.settlePosition.apply(this as never, args);
+    },
   };
   const ordersService = {
     create: jest.fn().mockResolvedValue(undefined),
@@ -106,7 +112,7 @@ function makeDeps(overrides: {
     riskConfigValues as never,
   );
 
-  return { service, gateway, strategy, riskManager, signalsService, tradesService, ordersService };
+  return { service, gateway, strategy, riskManager, signalsService, tradesService, ordersService, eventEmitter };
 }
 
 describe('ExecutionService (PAPER mode)', () => {
@@ -178,5 +184,179 @@ describe('ExecutionService (PAPER mode)', () => {
     await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
 
     expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
+  });
+
+  describe('short trades', () => {
+    const shortSignal = {
+      action: 'ENTER_SHORT',
+      symbol: 'BTCUSDT',
+      strategy: 'TrendRegimeStrategy',
+      candleTime: 1_000,
+      price: 100,
+      stopLoss: 110,
+      indicators: {},
+      reason: 'death cross',
+    };
+    const openShort = {
+      _id: 'trade2',
+      symbol: 'BTCUSDT',
+      side: 'SHORT',
+      mode: 'PAPER',
+      strategy: 'TrendRegimeStrategy',
+      timeframe: '1h',
+      entryPrice: 100,
+      qty: 2,
+      stopLoss: 110,
+      takeProfit: undefined,
+      entryTime: new Date(0),
+    };
+
+    it('opens a short with a SELL and persists side=SHORT', async () => {
+      const { service, gateway, tradesService, ordersService, eventEmitter } = makeDeps({ signal: shortSignal });
+
+      await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'SELL', type: 'MARKET', quantity: 1 }));
+      expect(tradesService.openPosition).toHaveBeenCalledWith(
+        expect.objectContaining({ side: 'SHORT', stopLoss: 110, timeframe: '1h', entryReason: 'death cross' }),
+      );
+      expect(ordersService.create).toHaveBeenCalledWith(expect.objectContaining({ side: 'SELL' }));
+      expect(eventEmitter.emit).toHaveBeenCalledWith(
+        'trade.opened',
+        expect.objectContaining({ side: 'SHORT', symbol: 'BTCUSDT', entryPrice: 100, strategy: 'TrendRegimeStrategy', timeframe: '1h' }),
+      );
+    });
+
+    it('stops out a short when the candle HIGH reaches the stop, buying back with a BUY', async () => {
+      const { service, gateway, tradesService, eventEmitter } = makeDeps({
+        candles: [candle(2_000, 108, 111, 105)], // high 111 >= stop 110
+        openTrade: openShort,
+        signal: { ...shortSignal, action: 'NONE' },
+      });
+
+      await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'BUY' }));
+      // Short loses when price rises: (100 - 110) * 2 = -20, -10%.
+      expect(tradesService.closePosition).toHaveBeenCalledWith(
+        'trade2',
+        expect.objectContaining({ exitPrice: 110, exitReason: 'SL', pnl: -20, pnlPct: -10 }),
+      );
+      expect(eventEmitter.emit).toHaveBeenCalledWith(
+        'trade.closed',
+        expect.objectContaining({ side: 'SHORT', reason: 'SL', pnl: -20, entryPrice: 100, exitPrice: 110, qty: 2 }),
+      );
+    });
+
+    it('does not stop out a short on a low below the stop (profitable direction)', async () => {
+      const { service, tradesService } = makeDeps({
+        candles: [candle(2_000, 90, 95, 85)],
+        openTrade: openShort,
+        signal: { ...shortSignal, action: 'NONE' },
+      });
+
+      await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+      expect(tradesService.closePosition).not.toHaveBeenCalled();
+    });
+
+    it('exits a short on the strategy EXIT signal with a positive pnl when price fell', async () => {
+      const { service, gateway, tradesService, eventEmitter } = makeDeps({
+        candles: [candle(2_000, 90, 95, 85)],
+        openTrade: openShort,
+        fillPrice: 90,
+        signal: { ...shortSignal, action: 'EXIT', price: 90, reason: 'EMA20 cruzou acima da EMA50' },
+      });
+
+      await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+      expect(gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'BUY', quantity: 2 }));
+      // (100 - 90) * 2 = +20, +10%.
+      expect(tradesService.closePosition).toHaveBeenCalledWith(
+        'trade2',
+        expect.objectContaining({ exitPrice: 90, exitReason: 'SIGNAL', pnl: 20, pnlPct: 10 }),
+      );
+      expect(eventEmitter.emit).toHaveBeenCalledWith(
+        'trade.closed',
+        expect.objectContaining({ reasonDetail: 'EMA20 cruzou acima da EMA50', pnl: 20 }),
+      );
+    });
+
+    it('never places an order when risk vetoes the short (e.g. SHORT_NOT_SUPPORTED on Spot)', async () => {
+      const { service, gateway, tradesService, signalsService } = makeDeps({
+        signal: shortSignal,
+        decision: { approved: false, rejectReason: 'SHORT_NOT_SUPPORTED' },
+      });
+
+      await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+      expect(gateway.placeOrder).not.toHaveBeenCalled();
+      expect(tradesService.openPosition).not.toHaveBeenCalled();
+      expect(signalsService.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'ENTER_SHORT' }),
+        expect.objectContaining({ rejectReason: 'SHORT_NOT_SUPPORTED' }),
+        'PAPER',
+      );
+    });
+  });
+
+  it('closes a LONG on a manual/automatic signal exit with a negative pnl when price fell', async () => {
+    const openLong = { _id: 'trade3', symbol: 'BTCUSDT', side: 'LONG', mode: 'PAPER', strategy: 'TrendRegimeStrategy', entryPrice: 100, qty: 2, stopLoss: 80, entryTime: new Date(0) };
+    const { service, gateway, tradesService } = makeDeps({
+      candles: [candle(2_000, 95, 97, 94)],
+      openTrade: openLong,
+      fillPrice: 95,
+      signal: { action: 'EXIT', symbol: 'BTCUSDT', strategy: 'TrendRegimeStrategy', candleTime: 2_000, price: 95, indicators: {}, reason: 'cross' },
+    });
+
+    await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'SELL' }));
+    expect(tradesService.closePosition).toHaveBeenCalledWith(
+      'trade3',
+      expect.objectContaining({ exitReason: 'SIGNAL', pnl: -10, pnlPct: -5 }),
+    );
+  });
+
+  it('closes a LONG on take profit when the high reaches the target', async () => {
+    const openLong = { _id: 'trade4', symbol: 'BTCUSDT', side: 'LONG', mode: 'PAPER', strategy: 'TrendRegimeStrategy', entryPrice: 100, qty: 1, stopLoss: 90, takeProfit: 120, entryTime: new Date(0) };
+    const { service, tradesService } = makeDeps({
+      candles: [candle(2_000, 118, 121, 110)],
+      openTrade: openLong,
+      signal: { action: 'NONE', symbol: 'BTCUSDT', strategy: 'TrendRegimeStrategy', candleTime: 2_000, price: 118, indicators: {}, reason: 'n/a' },
+    });
+
+    await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(tradesService.closePosition).toHaveBeenCalledWith(
+      'trade4',
+      expect.objectContaining({ exitPrice: 120, exitReason: 'TP', pnl: 20, pnlPct: 20 }),
+    );
+  });
+});
+
+describe('ExecutionService (LIVE/Binance gateway)', () => {
+  it('protects a short with a BUY stop-limit whose limit sits ABOVE the trigger', async () => {
+    const deps = makeDeps({
+      signal: {
+        action: 'ENTER_SHORT',
+        symbol: 'BTCUSDT',
+        strategy: 'TrendRegimeStrategy',
+        candleTime: 1_000,
+        price: 100,
+        stopLoss: 110,
+        indicators: {},
+        reason: 'test',
+      },
+    });
+    (deps.gateway as { kind: string }).kind = 'BINANCE';
+
+    await deps.service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(deps.gateway.placeOrder).toHaveBeenNthCalledWith(1, expect.objectContaining({ side: 'SELL', type: 'MARKET' }));
+    expect(deps.gateway.placeOrder).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ side: 'BUY', type: 'STOP_LOSS_LIMIT', stopPrice: 110, price: 110 * 1.001 }),
+    );
   });
 });

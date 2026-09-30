@@ -182,4 +182,106 @@ describe('BacktestRunner', () => {
     new BacktestRunner(spy, new RiskManagerService(PERMISSIVE_RISK_CONFIG), { ...baseParams, candleLookback: 3 }).run(GOLDEN_CROSS);
     expect(seen).toEqual([1, 2, 3, 3, 3, 3, 3, 3]);
   });
+
+  describe('short side', () => {
+    // GOLDEN_CROSS reflected around 100: a death cross at candle 6 (close 110), then candle 7
+    // spikes to 150 — far above any plausible short stop, forcing an SL exit.
+    const DEATH_CROSS: Candle[] = [
+      candle(0, 100, 101, 99),
+      candle(1, 105, 106, 104),
+      candle(2, 110, 111, 109),
+      candle(3, 115, 116, 114),
+      candle(4, 120, 121, 119),
+      candle(5, 125, 126, 124),
+      candle(6, 110, 111, 109),
+      candle(7, 120, 150, 118),
+    ];
+    const shortStrategy = () => new TrendRegimeStrategy(new IndicatorsService(), { ...TINY_STRATEGY_CONFIG, allowShort: 1 });
+    const runShort = (params: Partial<BacktestParams>, candles = DEATH_CROSS) =>
+      new BacktestRunner(shortStrategy(), new RiskManagerService(PERMISSIVE_RISK_CONFIG), {
+        ...baseParams,
+        feesPct: 0,
+        ...params,
+      }).run(candles);
+
+    it('opens a short on the death cross and stops out above, losing exactly risk%', () => {
+      const result = runShort({});
+
+      // After the stop-out, candle 7's jump is itself a golden cross in an up regime: a long opens
+      // and is closed MANUAL (pnl 0) at the end of data. Only the first trade matters here.
+      const [trade] = result.trades;
+      expect(result.trades.filter((t) => t.side === 'SHORT')).toHaveLength(1);
+      expect(trade.side).toBe('SHORT');
+      expect(trade.entryPrice).toBe(110);
+      expect(trade.stopLoss).toBeGreaterThan(110);
+      expect(trade.exitReason).toBe('SL');
+      expect(trade.exitPrice).toBe(trade.stopLoss);
+      expect(trade.pnl).toBeCloseTo(-100);
+      expect(trade.pnlPct).toBeLessThan(0);
+      expect(result.finalBalance).toBeCloseTo(9900);
+      expect(result.signals.filter((sg) => sg.action === 'ENTER_SHORT')).toHaveLength(1);
+    });
+
+    it('matches the mirrored long trade exactly (same risk, same result)', () => {
+      const long = run({ feesPct: 0 }).trades[0];
+      const short = runShort({}).trades[0];
+      expect(short.qty).toBeCloseTo(long.qty);
+      expect(short.pnl).toBeCloseTo(long.pnl);
+      expect(short.stopLoss - short.entryPrice).toBeCloseTo(long.entryPrice - long.stopLoss);
+    });
+
+    it('books a profit when price falls after the entry (take the stop out of reach)', () => {
+      const falling = [...DEATH_CROSS.slice(0, 7), candle(7, 100, 104, 99)];
+      const result = runShort({}, falling);
+      // Still open at the end of data: closed MANUAL at the last close (100), below the 110 entry.
+      const [trade] = result.trades;
+      expect(trade.side).toBe('SHORT');
+      expect(trade.exitReason).toBe('MANUAL');
+      expect(trade.exitPrice).toBe(100);
+      expect(trade.pnl).toBeCloseTo((110 - 100) * trade.qty);
+      expect(result.finalBalance).toBeCloseTo(10000 + trade.pnl);
+    });
+
+    it('marks open shorts to market with the right sign on the equity curve', () => {
+      const falling = [...DEATH_CROSS.slice(0, 7), candle(7, 100, 104, 99)];
+      const result = runShort({}, falling);
+      const last = result.equityCurve[result.equityCurve.length - 1];
+      // Price fell 110 -> 100 while short: equity is ABOVE the cash balance.
+      expect(last.openPositions).toBe(1);
+      expect(last.equity).toBeGreaterThan(last.balance);
+    });
+
+    it('applies slippage against the short: sells lower, buys back higher', () => {
+      const trade = runShort({ slippagePct: 0.01 }).trades[0];
+      expect(trade.entryPrice).toBeCloseTo(110 * 0.99);
+      expect(trade.exitPrice).toBeCloseTo(trade.stopLoss * 1.01);
+      expect(trade.slippageCost).toBeGreaterThan(0);
+    });
+
+    it('charges the short carry cost per day held, inside fees and pnl', () => {
+      const withoutCarry = runShort({}).trades[0];
+      // Held 1 candle = 60s in this fixture; 100%/day makes the cost visible: notional * 60/86400.
+      const withCarry = runShort({ shortBorrowPctPerDay: 1 }).trades[0];
+      const expected = withCarry.entryPrice * withCarry.qty * (60_000 / 86_400_000);
+      expect(withCarry.carryCost).toBeCloseTo(expected);
+      expect(withCarry.fees).toBeCloseTo(expected);
+      expect(withCarry.pnl).toBeCloseTo(withoutCarry.pnl - expected);
+    });
+
+    it('never charges carry on longs', () => {
+      const long = run({ shortBorrowPctPerDay: 1 }).trades[0];
+      expect(long.side).toBe('LONG');
+      expect(long.carryCost).toBe(0);
+    });
+
+    it('does not short at all with the default allowShort=0 (baseline stays long-only)', () => {
+      const baseline = new BacktestRunner(
+        new TrendRegimeStrategy(new IndicatorsService(), TINY_STRATEGY_CONFIG),
+        new RiskManagerService(PERMISSIVE_RISK_CONFIG),
+        { ...baseParams, feesPct: 0 },
+      ).run(DEATH_CROSS);
+      expect(baseline.trades.filter((t) => t.side === 'SHORT')).toHaveLength(0);
+      expect(baseline.signals.some((sg) => sg.action === 'ENTER_SHORT')).toBe(false);
+    });
+  });
 });

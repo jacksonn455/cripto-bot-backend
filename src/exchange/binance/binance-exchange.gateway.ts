@@ -15,6 +15,11 @@ import { BinanceRestClient } from './binance-rest.client';
 @Injectable()
 export class BinanceExchangeGateway implements ExchangeGateway {
   readonly kind: ExchangeGatewayKind = 'BINANCE';
+  /**
+   * Spot API: a SELL needs the asset in the wallet, there is no borrowing. Shorting for real would
+   * need Binance Margin (borrow + repay) or USD-M Futures — a different gateway, not this one.
+   */
+  readonly supportsShortSelling = false;
 
   private readonly logger = new Logger(BinanceExchangeGateway.name);
   private readonly client: BinanceRestClient;

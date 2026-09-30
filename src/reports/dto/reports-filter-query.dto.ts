@@ -18,6 +18,11 @@ export class ReportsFilterQueryDto {
   @IsString()
   strategy?: string;
 
+  @ApiPropertyOptional({ enum: ['LONG', 'SHORT'] })
+  @IsOptional()
+  @IsIn(['LONG', 'SHORT'])
+  side?: 'LONG' | 'SHORT';
+
   @ApiPropertyOptional({ description: 'Backtest run id (only trades of that execution)' })
   @IsOptional()
   @IsString()

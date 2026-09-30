@@ -57,3 +57,24 @@ describe('PaperExchangeGateway persistence', () => {
     await expect(gateway.getBalance('USDT')).resolves.toMatchObject({ free: 10_000 });
   });
 });
+
+describe('PaperExchangeGateway short selling', () => {
+  it('advertises short support (simulated) unlike Binance Spot', () => {
+    expect(new PaperExchangeGateway(BINANCE, TRADING).supportsShortSelling).toBe(true);
+  });
+
+  it('simulates a short as a negative base balance, and buying back settles the pnl in USDT', async () => {
+    const gateway = withFakeMarket(new PaperExchangeGateway(BINANCE, TRADING), 60_000);
+    await gateway.placeOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'MARKET', quantity: 0.1, newClientOrderId: 's1' });
+
+    await expect(gateway.getBalance('BTC')).resolves.toMatchObject({ free: -0.1 });
+    await expect(gateway.getBalance('USDT')).resolves.toMatchObject({ free: 16_000 });
+
+    withFakeMarket(gateway, 50_000);
+    await gateway.placeOrder({ symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: 0.1, newClientOrderId: 's2' });
+
+    // Sold 0.1 @ 60k, bought back @ 50k: +1,000 USDT, flat BTC.
+    await expect(gateway.getBalance('BTC')).resolves.toMatchObject({ free: 0 });
+    await expect(gateway.getBalance('USDT')).resolves.toMatchObject({ free: 11_000 });
+  });
+});

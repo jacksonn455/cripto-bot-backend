@@ -80,6 +80,13 @@ O bot só compra quando **todos** os itens da lista abaixo forem verdadeiros ao 
 
 Se qualquer um desses itens falhar, ele não compra — sem exceção.
 
+**E vender a descoberto (Short)?** Opcional e desligado por padrão (`TREND_ALLOW_SHORT=true` liga). É o
+espelho exato da regra acima: tendência de **baixa** no longo prazo, média rápida cruzando para **baixo** e
+RSI na faixa espelhada. O stop fica **acima** da entrada, e o lucro vem da queda do preço. Só funciona no modo
+simulado e no backtest, porque a Binance Spot não permite vender o que você não tem. Detalhes em
+[docs/TECNICO.md](docs/TECNICO.md#long-e-short), e a pesquisa sobre quando isso vale a pena em
+[docs/ESTRATEGIA-PESQUISA.md](docs/ESTRATEGIA-PESQUISA.md).
+
 ### Quando ele VENDE
 
 - **Stop loss** (limite de perda): todo trade já nasce com um preço definido onde, se o mercado
@@ -178,7 +185,9 @@ Glossário rápido das métricas:
 | Execução real testada contra a Binance de verdade | ⏳ pendente (o ambiente onde o bot foi desenvolvido não tem acesso à rede da Binance) |
 | Relatórios e métricas | ✅ pronto |
 | Botão de emergência / pausa automática | ✅ pronto |
-| Notificações (Telegram) | ✅ pronto (opcional) |
+| Notificações (Discord e/ou Telegram) | ✅ pronto (opcional, configurável por env) |
+| Operações Short | ✅ no backtest e no Paper (desligado por padrão: `TREND_ALLOW_SHORT`); ❌ no Live Spot (a Binance Spot não permite vender a descoberto) |
+| Análise com agentes da OpenAI | ✅ pronto (opcional, só análise: nunca abre nem fecha trades) |
 | Scanner de funding rate (mercado de futuros) | ✅ pronto |
 | Painel visual (dashboard) | ✅ pronto em [../frontend](../frontend) (7 telas) |
 | Autenticação do painel | ✅ login opcional por senha (`DASHBOARD_PASSWORD` no painel), além da chave `CONTROL_API_KEY` dos comandos |

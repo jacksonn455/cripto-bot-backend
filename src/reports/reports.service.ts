@@ -41,6 +41,8 @@ export class ReportsService {
           entryTime: t.entryTime,
           exitTime: t.exitTime ?? t.entryTime,
           exitReason: t.exitReason,
+          side: t.side,
+          fees: t.fees ?? 0,
         })),
         initialBalance,
       );
@@ -58,6 +60,14 @@ export class ReportsService {
     const key = `${CACHE_PREFIX}bySymbol:${JSON.stringify(filter)}:${page}:${limit}`;
     return this.cache.getOrSet(key, this.cacheConfig.reportsTtlSeconds, () =>
       this.groupBy('$symbol', filter, page, limit),
+    );
+  }
+
+  /** LONG vs SHORT side by side (a missing side on legacy trades is not expected: the field is required). */
+  async bySide(filter: ReportsFilter, page: number, limit: number): Promise<{ items: GroupedMetric[]; total: number }> {
+    const key = `${CACHE_PREFIX}bySide:${JSON.stringify(filter)}:${page}:${limit}`;
+    return this.cache.getOrSet(key, this.cacheConfig.reportsTtlSeconds, () =>
+      this.groupBy('$side', filter, page, limit),
     );
   }
 
@@ -175,6 +185,7 @@ export class ReportsService {
     if (filter.mode) match.mode = filter.mode;
     if (filter.symbol) match.symbol = filter.symbol.toUpperCase();
     if (filter.strategy) match.strategy = filter.strategy;
+    if (filter.side) match.side = filter.side;
     if (filter.runId) match.runId = filter.runId;
     if (filter.from || filter.to) {
       match[filter.dateField ?? 'entryTime'] = {

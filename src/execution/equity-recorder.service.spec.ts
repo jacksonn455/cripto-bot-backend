@@ -51,4 +51,15 @@ describe('EquityRecorderService', () => {
     await expect(service.record()).resolves.toBeUndefined();
     expect(equitySnapshots.insertMany).not.toHaveBeenCalled();
   });
+
+  it('values an open short as a liability (-qty * price), since its sale proceeds are already in cash', async () => {
+    const { service, equitySnapshots } = makeService({
+      openTrades: [{ symbol: 'BTCUSDT', side: 'SHORT', qty: 2, entryPrice: 100 }],
+    });
+
+    await service.record();
+
+    // cash 9100 includes the 200 of short proceeds; price rose to 110, so equity = 9100 - 220.
+    expect(equitySnapshots.insertMany).toHaveBeenCalledWith([expect.objectContaining({ equity: 9100 - 2 * 110 })]);
+  });
 });

@@ -22,5 +22,6 @@ import { BacktestRun, BacktestRunSchema } from './schemas/backtest-run.schema';
   ],
   controllers: [BacktestController],
   providers: [BacktestService],
+  exports: [BacktestService],
 })
 export class BacktestModule {}

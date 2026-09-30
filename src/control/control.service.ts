@@ -6,6 +6,8 @@ import { executionConfig, tradingConfig } from '../config/configuration';
 import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import { generateClientOrderId } from '../execution/client-order-id.util';
+import { exitOrderSide } from '../trades/position-math.util';
+import { TRADE_CLOSED } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
 import { RuntimeStatusService, SignalSnapshot } from './runtime-status.service';
 import { BotState, BotStateDocument } from './schemas/bot-state.schema';
@@ -155,20 +157,17 @@ export class ControlService {
         const clientOrderId = generateClientOrderId(mode, trade.symbol, Date.now(), 'EXIT');
         const order = await this.gateway.placeOrder({
           symbol: trade.symbol,
-          side: 'SELL',
+          side: exitOrderSide(trade.side),
           type: 'MARKET',
           quantity: trade.qty,
           newClientOrderId: clientOrderId,
         });
-        const exitPrice = order.price || trade.entryPrice;
-        await this.tradesService.closePosition(String(trade._id), {
-          exitPrice,
+        const closed = await this.tradesService.settlePosition(trade, {
+          exitPrice: order.price || trade.entryPrice,
           exitTime: new Date(),
-          fees: 0,
-          pnl: (exitPrice - trade.entryPrice) * trade.qty,
-          pnlPct: ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100,
           exitReason: 'KILL_SWITCH',
         });
+        this.eventEmitter.emit(TRADE_CLOSED, closed);
         closedPositions += 1;
       } catch (err) {
         this.logger.error(`Kill switch: failed to close ${trade.symbol}: ${(err as Error).message}`);

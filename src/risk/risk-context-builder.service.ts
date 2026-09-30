@@ -36,14 +36,16 @@ export class RiskContextBuilderService {
 
     const currentExposureByAsset: Record<string, number> = {};
     let totalExposure = 0;
+    let shortNotional = 0;
     for (const trade of openTrades) {
       const notional = trade.qty * trade.entryPrice;
       currentExposureByAsset[trade.symbol] = (currentExposureByAsset[trade.symbol] ?? 0) + notional;
       totalExposure += notional;
+      if (trade.side === 'SHORT') shortNotional += notional;
     }
 
     return {
-      accountEquity: balance?.free ?? 0,
+      accountEquity: this.buyingPower(balance?.free ?? 0, shortNotional),
       openPositionsCount: openTrades.length,
       currentExposureByAsset,
       totalExposure,
@@ -52,7 +54,18 @@ export class RiskContextBuilderService {
       isPaused,
       reconciliationOk,
       symbolFilters,
+      shortSellingSupported: gateway.supportsShortSelling === true,
     };
+  }
+
+  /**
+   * Free quote balance available to size new trades. A long spends its notional (cash goes down);
+   * a short *receives* its sale proceeds (cash goes up) while also tying up the same amount as
+   * 1:1 collateral. Removing both keeps a short consuming buying power exactly like a long,
+   * instead of letting the proceeds inflate the next position size.
+   */
+  private buyingPower(freeQuote: number, openShortNotional: number): number {
+    return Math.max(0, freeQuote - 2 * openShortNotional);
   }
 
   private countConsecutiveStopLosses(recentClosedTradesDesc: { exitReason?: string }[]): number {

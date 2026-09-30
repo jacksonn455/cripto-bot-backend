@@ -36,9 +36,35 @@ services:
         value: "true"
       - key: SWAGGER_ENABLED
         value: "false"
+      # No Redis on Render: the cache is off on purpose (reports read Mongo directly).
+      - key: REDIS_ENABLED
+        value: "false"
       - key: REDIS_URL
         value: ""
+      # Shorts are simulated in PAPER only; keep off until a backtest justifies it.
+      - key: TREND_ALLOW_SHORT
+        value: "false"
+      # Integrations: switched on/off in Render > Environment (true/false), never forced by this file.
+      - key: DISCORD_ENABLED
+        sync: false
+      - key: DISCORD_EVENTS
+        value: alerts,trades
+      - key: OPENAI_AGENTS_ENABLED
+        sync: false
+      - key: OPENAI_TRACING_ENABLED
+        value: "false"
       - key: MONGO_URI
         sync: false
       - key: CONTROL_API_KEY
+        sync: false
+      # Secrets: set in Render > Environment (sync: false = never stored in this file).
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
         sync: false

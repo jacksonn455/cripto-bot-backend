@@ -1,8 +1,11 @@
 import { Candle } from '../exchange/types/candle.type';
+import type { TradeSide } from '../trades/schemas/trade.schema';
 
 export interface StopTargetLevels {
   stopLoss: number;
   takeProfit?: number;
+  /** Defaults to LONG (stop below, target above). SHORT mirrors it: stop above, target below. */
+  side?: TradeSide;
 }
 
 /**
@@ -14,8 +17,11 @@ export function checkIntraCandleExit(
   levels: StopTargetLevels,
   candle: Pick<Candle, 'high' | 'low'>,
 ): { exitPrice: number; reason: 'SL' | 'TP' } | null {
-  const hitStop = candle.low <= levels.stopLoss;
-  const hitTarget = levels.takeProfit !== undefined && candle.high >= levels.takeProfit;
+  const isShort = levels.side === 'SHORT';
+  const hitStop = isShort ? candle.high >= levels.stopLoss : candle.low <= levels.stopLoss;
+  const hitTarget =
+    levels.takeProfit !== undefined &&
+    (isShort ? candle.low <= levels.takeProfit : candle.high >= levels.takeProfit);
   if (hitStop) return { exitPrice: levels.stopLoss, reason: 'SL' };
   if (hitTarget) return { exitPrice: levels.takeProfit!, reason: 'TP' };
   return null;

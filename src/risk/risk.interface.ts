@@ -19,16 +19,23 @@ export interface RiskContext {
   reconciliationOk: boolean;
   symbolLiquidity?: SymbolLiquidity;
   symbolFilters?: SymbolFilters;
+  /**
+   * Whether the venue can open short positions (sell an asset the account doesn't hold).
+   * Binance Spot can't; the paper gateway and backtests simulate it. Absent = not supported.
+   */
+  shortSellingSupported?: boolean;
 }
 
 export type RejectReason =
   | 'BOT_PAUSED'
   | 'RECONCILIATION_FAILED'
+  | 'SHORT_NOT_SUPPORTED'
   | 'DAILY_LOSS_LIMIT'
   | 'CONSECUTIVE_STOPS_LIMIT'
   | 'MAX_OPEN_POSITIONS'
   | 'MISSING_STOP_LOSS'
   | 'INVALID_STOP_DISTANCE'
+  | 'INVALID_TAKE_PROFIT'
   | 'MAX_EXPOSURE_EXCEEDED'
   | 'RR_TOO_LOW'
   | 'LOW_LIQUIDITY'

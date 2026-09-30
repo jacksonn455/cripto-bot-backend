@@ -33,6 +33,7 @@ describe('TrendRegimeStrategy params', () => {
       atrStopMultiplier: 2,
       chandelierLookback: 22,
       chandelierAtrMultiplier: 3,
+      allowShort: 0,
     });
     expect(strategy.paramSpec.map((p) => p.key)).toEqual(Object.keys(strategy.getParams()));
   });
@@ -50,6 +51,8 @@ describe('TrendRegimeStrategy params', () => {
     [{ emaFast: 1 }, 'emaFast must be between 2 and 200'],
     [{ emaFast: 60 }, 'emaFast must be lower than emaSlow'],
     [{ rsiMin: 80 }, 'rsiMin must be lower than rsiMax'],
+    [{ allowShort: 2 }, 'allowShort must be between 0 and 1'],
+    [{ allowShort: 0.5 }, 'allowShort must be an integer'],
   ])('rejects %j', (overrides, message) => {
     expect(() => strategy.withParams(overrides)).toThrow(StrategyParamsError);
     expect(() => strategy.withParams(overrides)).toThrow(message);
