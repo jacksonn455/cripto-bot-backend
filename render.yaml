@@ -43,7 +43,7 @@ services:
         value: ""
       # Shorts are simulated in PAPER only; keep off until a backtest justifies it.
       - key: TREND_ALLOW_SHORT
-        value: "false"
+        value: "true"
       # Integrations: switched on/off in Render > Environment (true/false), never forced by this file.
       - key: DISCORD_ENABLED
         sync: false
