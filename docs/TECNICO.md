@@ -161,7 +161,8 @@ gráficos a cada poucos segundos. `RedisCacheService` ([src/cache](../src/cache)
   cache miss, caindo de volta para consultar o Mongo direto. Cache aqui é só performance, nunca
   uma dependência de corretude (mesma filosofia de fail-open usada com a Binance no resto do
   projeto).
-- **`REDIS_URL`** (padrão `redis://localhost:6379`, ou `redis://redis:6379` dentro do Docker
+- **`REDIS_URL`**: em uso, Upstash via TLS (`rediss://default:<token>@<db>.upstash.io:6379`, o token
+  é o `UPSTASH_REDIS_REST_TOKEN`; no Render fica como secret). Local: `redis://localhost:6379`, ou `redis://redis:6379` dentro do Docker
   Compose) e **`REPORTS_CACHE_TTL_SECONDS`** (padrão `30`) ficam no `.env`.
 
 ### Redis: onde é usado e o que acontece sem ele

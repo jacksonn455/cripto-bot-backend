@@ -36,11 +36,12 @@ services:
         value: "true"
       - key: SWAGGER_ENABLED
         value: "false"
-      # No Redis on Render: the cache is off on purpose (reports read Mongo directly).
+      # Reports/charts cache on Upstash (fail-open: without it, reports read Mongo directly).
       - key: REDIS_ENABLED
-        value: "false"
+        value: "true"
+      # Secret (contains the Upstash token): rediss://default:<token>@<db>.upstash.io:6379
       - key: REDIS_URL
-        value: ""
+        sync: false
       # Shorts are simulated in PAPER only; keep off until a backtest justifies it.
       - key: TREND_ALLOW_SHORT
         value: "true"
