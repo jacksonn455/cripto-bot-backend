@@ -53,6 +53,27 @@ interface RawOrder {
   time?: number;
 }
 
+/** Extra attempts for idempotent reads (klines, exchangeInfo, ping): 0.5 s, then 1.5 s. */
+const READ_RETRY = 2;
+const RETRY_BASE_DELAY_MS = 500;
+/** Fail-fast network errors worth retrying. A timeout is NOT retried: it already cost BINANCE_HTTP_TIMEOUT_MS. */
+const TRANSIENT_NETWORK_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH']);
+
+/**
+ * Transient = no HTTP response because of a network error, or an HTTP 5xx. 4xx (incl. 403/451 geo
+ * blocks, 418/429 rate limits) is not: retrying can't fix it and would only add load.
+ */
+export function isTransient(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { response?: { status?: number }; code?: string };
+  if (e.response) return (e.response.status ?? 0) >= 500;
+  return e.code !== undefined && TRANSIENT_NETWORK_CODES.has(e.code);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Thin typed wrapper around the untyped @binance/connector Spot client.
  * This is the only place in the codebase that talks to the raw Binance response shapes.
@@ -76,13 +97,14 @@ export class BinanceRestClient {
   }
 
   async ping(): Promise<void> {
-    await this.call(() => this.client.ping());
+    await this.call(() => this.client.ping(), READ_RETRY);
   }
 
   async getCandles(params: GetCandlesParams): Promise<Candle[]> {
     const { symbol, interval, limit, startTime, endTime } = params;
     const data = await this.call<unknown[][]>(() =>
       this.client.klines(symbol, interval, { limit, startTime, endTime }),
+      READ_RETRY,
     );
     const now = Date.now();
     return data.map((row) => {
@@ -121,6 +143,7 @@ export class BinanceRestClient {
   async getSymbolFilters(symbol: string): Promise<SymbolFilters> {
     const info = await this.call<RawExchangeInfo>(() =>
       this.client.exchangeInfo({ symbol }),
+      READ_RETRY,
     );
     const symbolInfo = info.symbols[0];
     if (!symbolInfo) {
@@ -223,13 +246,20 @@ export class BinanceRestClient {
     await this.call(() => this.client.closeListenKey(listenKey));
   }
 
-  /** Unwraps the SDK's axios response and turns failures into a compact, loggable Error. */
-  private async call<T>(fn: () => Promise<{ data: unknown }>): Promise<T> {
-    try {
-      const response = await fn();
-      return response.data as T;
-    } catch (err) {
-      throw this.toCleanError(err);
+  /**
+   * Unwraps the SDK's axios response and turns failures into a compact, loggable Error.
+   * `retries` > 0 only for idempotent public reads: a transient network error or 5xx is retried
+   * with backoff; orders, cancels and account calls are never retried here.
+   */
+  private async call<T>(fn: () => Promise<{ data: unknown }>, retries = 0): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await fn();
+        return response.data as T;
+      } catch (err) {
+        if (attempt >= retries || !isTransient(err)) throw this.toCleanError(err);
+        await sleep(RETRY_BASE_DELAY_MS * 3 ** attempt);
+      }
     }
   }
 
