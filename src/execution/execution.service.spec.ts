@@ -1,7 +1,8 @@
+import { InMemoryEvaluationSnapshotStore } from '../control/evaluation-snapshot.store';
 import { TradesService } from '../trades/trades.service';
 import { Candle } from '../exchange/types/candle.type';
 import { InMemoryEvaluationCheckpointStore } from './evaluation-checkpoint.store';
-import { ExecutionService } from './execution.service';
+import { ExecutionService, MarketDataError } from './execution.service';
 
 function candle(closeTime: number, close: number, high: number, low: number): Candle {
   return {
@@ -36,6 +37,7 @@ function makeDeps(overrides: {
   candles?: Candle[];
   fillPrice?: number;
   checkpoints?: InMemoryEvaluationCheckpointStore;
+  snapshots?: InMemoryEvaluationSnapshotStore;
 } = {}) {
   const candles = overrides.candles ?? [candle(1_000, 100, 101, 99)];
   const signal = overrides.signal ?? {
@@ -96,6 +98,7 @@ function makeDeps(overrides: {
   const eventEmitter = { emit: jest.fn() };
   const riskConfigValues = { maxDailyLossPct: 0.03, maxConsecutiveStops: 3 };
   const checkpoints = overrides.checkpoints ?? new InMemoryEvaluationCheckpointStore();
+  const snapshots = overrides.snapshots ?? new InMemoryEvaluationSnapshotStore();
 
   const service = new ExecutionService(
     gateway as never,
@@ -114,9 +117,22 @@ function makeDeps(overrides: {
     EXECUTION_CONFIG as never,
     riskConfigValues as never,
     checkpoints,
+    snapshots,
   );
 
-  return { service, checkpoints, gateway, strategy, riskManager, signalsService, tradesService, ordersService, eventEmitter };
+  return {
+    service,
+    checkpoints,
+    snapshots,
+    gateway,
+    strategy,
+    riskManager,
+    riskContextBuilder,
+    signalsService,
+    tradesService,
+    ordersService,
+    eventEmitter,
+  };
 }
 
 describe('ExecutionService (PAPER mode)', () => {
@@ -380,11 +396,12 @@ describe('ExecutionService - idempotency and restart recovery', () => {
 
   it('a restarted process does not re-evaluate the candle the previous one already handled', async () => {
     const checkpoints = new InMemoryEvaluationCheckpointStore();
-    const before = makeDeps({ checkpoints });
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    const before = makeDeps({ checkpoints, snapshots });
     await expect(before.service.runCycle('BTCUSDT', 'TrendRegimeStrategy')).resolves.toMatchObject({ status: 'evaluated' });
 
-    // "Restart": brand-new service instance (empty memory), same persisted checkpoints.
-    const after = makeDeps({ checkpoints });
+    // "Restart": brand-new service instance (empty memory), same persisted checkpoints and snapshots.
+    const after = makeDeps({ checkpoints, snapshots });
     await expect(after.service.runCycle('BTCUSDT', 'TrendRegimeStrategy')).resolves.toMatchObject({
       status: 'already-evaluated',
     });
@@ -485,5 +502,194 @@ describe('ExecutionService - idempotency and restart recovery', () => {
       candleCloseTime: t0 + HOUR,
     });
     expect(deps.gateway.placeOrder).toHaveBeenCalledWith(expect.objectContaining({ side: 'SELL', type: 'MARKET' }));
+  });
+});
+
+describe('ExecutionService - persisted evaluation snapshots (dashboard after a restart)', () => {
+  const HOUR = 3_600_000;
+  const T0 = 10 * HOUR;
+  const conditions = {
+    side: 'LONG' as const,
+    cross: { ok: false, emaFast: 99, emaSlow: 100 },
+    regime: { ok: true, close: 100, ema: 90, bandPct: 0 },
+    rsi: { ok: true, value: 55, min: 45, max: 70 },
+  };
+  const hold = (closeTime: number) => ({
+    action: 'NONE',
+    symbol: 'BTCUSDT',
+    strategy: 'TrendRegimeStrategy',
+    candleTime: closeTime,
+    price: 100,
+    indicators: { emaFast: 99, emaSlow: 100, emaRegime: 90, rsi: 55 },
+    reason: 'sem cruzamento EMA rapida/lenta',
+    conditions,
+  });
+  const run = (deps: ReturnType<typeof makeDeps>) => deps.service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+  const stored = async (deps: ReturnType<typeof makeDeps>) => (await deps.snapshots.get('PAPER', 'BTCUSDT'))!;
+
+  it('first execution ever (no checkpoint, no snapshot): evaluates and stores the snapshot', async () => {
+    const deps = makeDeps({ candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+
+    await expect(run(deps)).resolves.toMatchObject({ status: 'evaluated' });
+
+    const { snapshot } = await stored(deps);
+    expect(snapshot).toMatchObject({
+      source: 'cycle',
+      action: 'HOLD',
+      candleOpenTime: T0 - HOUR,
+      candleCloseTime: T0,
+      side: 'LONG',
+      indicators: { emaFast: 99, emaSlow: 100, emaRegime: 90, rsi: 55 },
+      decision: { outcome: 'NOT_ENTERED', reason: 'sem cruzamento EMA rapida/lenta' },
+    });
+    expect(snapshot!.conditions!.map((c) => [c.key, c.ok])).toEqual([
+      ['cross', false],
+      ['regime', true],
+      ['rsi', true],
+    ]);
+  });
+
+  it('restart with a stored snapshot: reuses it, without running the strategy or touching risk/orders', async () => {
+    const checkpoints = new InMemoryEvaluationCheckpointStore();
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    const before = makeDeps({ checkpoints, snapshots, candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    await run(before);
+    const original = (await stored(before)).snapshot;
+
+    const after = makeDeps({ checkpoints, snapshots, candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    await expect(run(after)).resolves.toMatchObject({ status: 'already-evaluated' });
+
+    expect(after.strategy.onCandleClosed).not.toHaveBeenCalled();
+    expect(after.riskManager.evaluate).not.toHaveBeenCalled();
+    expect(after.gateway.placeOrder).not.toHaveBeenCalled();
+    expect((await stored(after)).snapshot).toEqual(original);
+  });
+
+  it('restart without a stored snapshot: re-runs only the strategy, informationally, and stores it', async () => {
+    const checkpoints = new InMemoryEvaluationCheckpointStore();
+    // A previous run (before snapshots existed) evaluated the candle: checkpoint committed, nothing stored.
+    await checkpoints.claim('PAPER:BTCUSDT:1h', T0, 'old');
+    await checkpoints.commit('PAPER:BTCUSDT:1h', T0, 'old');
+    // Even an entry signal must not trade here: the candle was already handled.
+    const entry = {
+      ...hold(T0),
+      action: 'ENTER_LONG',
+      stopLoss: 90,
+      conditions: { ...conditions, cross: { ...conditions.cross, ok: true } },
+    };
+    const deps = makeDeps({ checkpoints, candles: [candle(T0, 100, 101, 99)], signal: entry });
+
+    await expect(run(deps)).resolves.toMatchObject({ status: 'already-evaluated' });
+
+    expect(deps.strategy.onCandleClosed).toHaveBeenCalledTimes(1);
+    expect(deps.riskManager.evaluate).not.toHaveBeenCalled();
+    expect(deps.riskContextBuilder.build).not.toHaveBeenCalled();
+    expect(deps.signalsService.record).not.toHaveBeenCalled();
+    expect(deps.gateway.placeOrder).not.toHaveBeenCalled();
+    expect(deps.tradesService.openPosition).not.toHaveBeenCalled();
+    expect(deps.ordersService.create).not.toHaveBeenCalled();
+    expect((await stored(deps)).snapshot).toMatchObject({
+      source: 'reconciliation',
+      action: 'ENTER_LONG',
+      candleCloseTime: T0,
+      decision: { outcome: 'INFORMATIONAL' },
+    });
+  });
+
+  it('two restarts on the same candle: one trade in total, and the cycle snapshot is never overwritten', async () => {
+    const checkpoints = new InMemoryEvaluationCheckpointStore();
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    // Default signal: ENTER_LONG approved by risk.
+    const newProcess = () => makeDeps({ checkpoints, snapshots, candles: [candle(T0, 100, 101, 99)] });
+    const first = newProcess();
+    await run(first);
+    const original = (await stored(first)).snapshot;
+    expect(original).toMatchObject({ source: 'cycle', decision: { outcome: 'ENTERED' } });
+
+    const second = newProcess();
+    const third = newProcess();
+    await run(second);
+    await run(third);
+    await run(third); // and the next tick of the same process
+
+    const all = [first, second, third];
+    expect(all.reduce((n, d) => n + d.gateway.placeOrder.mock.calls.length, 0)).toBe(1);
+    expect(all.reduce((n, d) => n + d.tradesService.openPosition.mock.calls.length, 0)).toBe(1);
+    expect((await stored(third)).snapshot).toEqual(original);
+  });
+
+  it('a reconciliation snapshot never replaces a cycle one of the same candle', async () => {
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    const deps = makeDeps({ snapshots, candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    await run(deps);
+    const original = (await stored(deps)).snapshot!;
+
+    await expect(snapshots.save({ ...original, source: 'reconciliation', action: 'ENTER_LONG' })).resolves.toBe(false);
+    expect((await stored(deps)).snapshot).toEqual(original);
+  });
+
+  it('exchange failure: the cycle fails as MarketDataError, the error is stored, and the next fetch clears it', async () => {
+    const deps = makeDeps({ candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    deps.gateway.getCandles.mockRejectedValueOnce(new Error('ETIMEDOUT api.binance.com'));
+
+    await expect(run(deps)).rejects.toThrow(MarketDataError);
+    await expect(stored(deps)).resolves.toMatchObject({
+      snapshot: null,
+      lastError: expect.stringContaining('ETIMEDOUT api.binance.com'),
+      lastErrorAt: expect.any(Date),
+    });
+    expect(deps.gateway.placeOrder).not.toHaveBeenCalled();
+
+    await expect(run(deps)).resolves.toMatchObject({ status: 'evaluated' });
+    await expect(stored(deps)).resolves.toMatchObject({
+      lastError: null,
+      snapshot: expect.objectContaining({ candleCloseTime: T0 }),
+    });
+  });
+
+  it('an exchange failure after a restart keeps the last snapshot visible next to the error', async () => {
+    const deps = makeDeps({ candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    await run(deps);
+
+    const restarted = makeDeps({ checkpoints: deps.checkpoints, snapshots: deps.snapshots });
+    restarted.gateway.getCandles.mockRejectedValueOnce(new Error('HTTP 451'));
+    await expect(run(restarted)).rejects.toThrow(MarketDataError);
+
+    await expect(stored(deps)).resolves.toMatchObject({
+      snapshot: expect.objectContaining({ candleCloseTime: T0, source: 'cycle' }),
+      lastError: expect.stringContaining('HTTP 451'),
+    });
+  });
+
+  it('after downtime of several candles, reports the gap and evaluates only the latest candle', async () => {
+    const checkpoints = new InMemoryEvaluationCheckpointStore();
+    const first = makeDeps({ checkpoints, candles: [candle(T0, 100, 101, 99)], signal: hold(T0) });
+    await run(first);
+
+    const candles = [0, 1, 2, 3].map((k) => candle(T0 + k * HOUR, 100, 101, 99));
+    const restarted = makeDeps({ checkpoints, candles, signal: hold(T0 + 3 * HOUR) });
+    await expect(run(restarted)).resolves.toMatchObject({ status: 'evaluated', missedCandles: 2 });
+
+    expect(restarted.strategy.onCandleClosed).toHaveBeenCalledTimes(1);
+    expect(restarted.eventEmitter.emit).toHaveBeenCalledWith('worker.gap', {
+      symbol: 'BTCUSDT',
+      mode: 'PAPER',
+      timeframe: '1h',
+      missedCandles: 2,
+      lastEvaluatedCandleClose: new Date(T0).toISOString(),
+      firstMissedCandleClose: new Date(T0 + HOUR).toISOString(),
+      lastMissedCandleClose: new Date(T0 + 2 * HOUR).toISOString(),
+      evaluatedCandleClose: new Date(T0 + 3 * HOUR).toISOString(),
+    });
+  });
+
+  it('a failing snapshot store never breaks the trading cycle', async () => {
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    jest.spyOn(snapshots, 'save').mockRejectedValue(new Error('Mongo down'));
+    jest.spyOn(snapshots, 'clearError').mockRejectedValue(new Error('Mongo down'));
+    const deps = makeDeps({ snapshots });
+
+    await expect(run(deps)).resolves.toMatchObject({ status: 'evaluated' });
+    expect(deps.gateway.placeOrder).toHaveBeenCalledTimes(1);
   });
 });

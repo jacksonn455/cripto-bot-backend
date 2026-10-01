@@ -3,6 +3,7 @@ import { trendRegimeConfig } from '../config/configuration';
 import { Candle } from '../exchange/types/candle.type';
 import { IndicatorsService } from '../indicators/indicators.service';
 import {
+  EntryConditions,
   mergeStrategyParams,
   OpenPositionInfo,
   Signal,
@@ -210,6 +211,12 @@ export class TrendRegimeStrategy implements Strategy {
     const crossedUp = this.crossedAbove(emaFast, emaSlow, i);
     const rsiOk =
       rsiValue !== undefined && rsiValue >= this.config.rsiMin && rsiValue <= this.config.rsiMax;
+    const longConditions: EntryConditions = {
+      side: 'LONG',
+      cross: { ok: crossedUp, emaFast: emaFast[i], emaSlow: emaSlow[i] },
+      regime: { ok: regimeIsUp, close: lastRegimeClose, ema: lastEmaRegime, bandPct: band },
+      rsi: { ok: rsiOk, value: rsiValue, min: this.config.rsiMin, max: this.config.rsiMax },
+    };
 
     if (regimeIsUp && crossedUp && rsiOk && adxOk && atrValue !== undefined) {
       const stopLoss = last.close - this.config.atrStopMultiplier * atrValue;
@@ -221,6 +228,7 @@ export class TrendRegimeStrategy implements Strategy {
         price: last.close,
         stopLoss,
         indicators: indicatorsSnapshot,
+        conditions: longConditions,
         reason:
           `EMA${this.config.emaFast} cruzou acima da EMA${this.config.emaSlow}, ` +
           `RSI(${this.config.rsiPeriod})=${rsiValue.toFixed(1)} dentro de ` +
@@ -232,6 +240,12 @@ export class TrendRegimeStrategy implements Strategy {
     const [shortRsiMin, shortRsiMax] = this.shortRsiBand();
     const crossedDown = this.crossedBelow(emaFast, emaSlow, i);
     const shortRsiOk = rsiValue !== undefined && rsiValue >= shortRsiMin && rsiValue <= shortRsiMax;
+    const shortConditions: EntryConditions = {
+      side: 'SHORT',
+      cross: { ok: crossedDown, emaFast: emaFast[i], emaSlow: emaSlow[i] },
+      regime: { ok: regimeIsDown, close: lastRegimeClose, ema: lastEmaRegime, bandPct: band },
+      rsi: { ok: shortRsiOk, value: rsiValue, min: shortRsiMin, max: shortRsiMax },
+    };
 
     if (this.shortEnabled && regimeIsDown && crossedDown && shortRsiOk && adxOk && atrValue !== undefined) {
       const stopLoss = last.close + this.config.atrStopMultiplier * atrValue;
@@ -243,6 +257,7 @@ export class TrendRegimeStrategy implements Strategy {
         price: last.close,
         stopLoss,
         indicators: indicatorsSnapshot,
+        conditions: shortConditions,
         reason:
           `EMA${this.config.emaFast} cruzou abaixo da EMA${this.config.emaSlow}, ` +
           `RSI(${this.config.rsiPeriod})=${rsiValue.toFixed(1)} dentro de ` +
@@ -262,6 +277,7 @@ export class TrendRegimeStrategy implements Strategy {
           price: last.close,
           stopLoss: last.close - this.config.atrStopMultiplier * atrValue,
           indicators: { ...indicatorsSnapshot, pullback: 1 },
+          conditions: longConditions,
           reason:
             `Pullback: EMA${this.config.emaFast} > EMA${this.config.emaSlow} nos últimos ${this.pullbackLookback} candles, ` +
             `preço tocou a EMA${this.config.emaFast} e fechou acima da máxima anterior, regime de alta`,
@@ -276,6 +292,7 @@ export class TrendRegimeStrategy implements Strategy {
           price: last.close,
           stopLoss: last.close + this.config.atrStopMultiplier * atrValue,
           indicators: { ...indicatorsSnapshot, pullback: 1 },
+          conditions: shortConditions,
           reason:
             `Pullback (short): EMA${this.config.emaFast} < EMA${this.config.emaSlow} nos últimos ${this.pullbackLookback} candles, ` +
             `preço tocou a EMA${this.config.emaFast} e fechou abaixo da mínima anterior, regime de baixa`,
@@ -283,17 +300,19 @@ export class TrendRegimeStrategy implements Strategy {
       }
     }
 
-    return this.none(
+    const judgedShort = this.shortEnabled && !regimeIsUp;
+    const waiting = this.none(
       symbol,
       last,
       indicatorsSnapshot,
       this.withAdxReason(
-        this.shortEnabled && !regimeIsUp
+        judgedShort
           ? this.explainNoShortEntry(regimeIsDown, crossedDown, shortRsiOk)
           : this.explainNoEntry(regimeIsUp, crossedUp, rsiOk),
         adxOk,
       ),
     );
+    return { ...waiting, conditions: judgedShort ? shortConditions : longConditions };
   }
 
   private get trailingSinceEntry(): boolean {

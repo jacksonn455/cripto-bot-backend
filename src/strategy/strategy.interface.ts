@@ -35,6 +35,21 @@ export interface Signal {
   trailingStop?: number;
   indicators: Record<string, number | undefined>;
   reason: string;
+  /**
+   * The entry conditions exactly as this decision judged them (observability only — never read for
+   * trading). Absent with an open position, where the strategy evaluates exits instead.
+   */
+  conditions?: EntryConditions;
+}
+
+/** The three entry rules of one side, with the values the strategy compared. */
+export interface EntryConditions {
+  side: 'LONG' | 'SHORT';
+  /** EMA fast crossed the slow one (above for LONG, below for SHORT) on this candle. */
+  cross: { ok: boolean; emaFast?: number; emaSlow?: number };
+  /** Higher-timeframe close vs. its EMA (× (1 ± band) when the regime band is on). */
+  regime: { ok: boolean; close: number; ema?: number; bandPct: number };
+  rsi: { ok: boolean; value?: number; min: number; max: number };
 }
 
 /**

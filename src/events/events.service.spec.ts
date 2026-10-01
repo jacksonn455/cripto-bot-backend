@@ -91,7 +91,8 @@ describe('RuntimeStatusService', () => {
     expect(emitter.emit).toHaveBeenCalledWith('bot.cycle', expect.objectContaining({ symbol: 'BTCUSDT', action: 'HOLD', reason: 'sem cruzamento' }));
   });
 
-  it('carries the evaluated candle and indicators in the event and in the status snapshot', () => {
+  // The per-symbol snapshot now lives in evaluation_snapshots (see ControlService.getStatus).
+  it('carries the evaluated candle and indicators in the event', () => {
     const emitter = { emit: jest.fn() };
     const status = new RuntimeStatusService(emitter as never);
     const indicators = { emaFast: 100, emaSlow: 101, rsi: 55, atr: 2, emaRegime: 90 };
@@ -99,6 +100,6 @@ describe('RuntimeStatusService', () => {
 
     const expected = { candleTime: '2026-09-29T12:59:59.999Z', price: 99, indicators };
     expect(emitter.emit).toHaveBeenCalledWith('bot.cycle', expect.objectContaining(expected));
-    expect(status.getLastSignalBySymbol().ETHUSDT).toMatchObject(expected);
+    expect(status.getLastCycleAt()).not.toBeNull();
   });
 });

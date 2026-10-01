@@ -1,8 +1,10 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Interval } from '@nestjs/schedule';
 import { executionConfig, riskConfig, tradingConfig, trendRegimeConfig } from '../config/configuration';
 import { ControlService } from '../control/control.service';
+import { EVALUATION_SNAPSHOT_STORE, InMemoryEvaluationSnapshotStore } from '../control/evaluation-snapshot.store';
+import type { EvaluationSnapshot, EvaluationSnapshotStore } from '../control/evaluation-snapshot.store';
 import { RuntimeStatusService } from '../control/runtime-status.service';
 import { WORKER_INSTANCE_ID, WORKER_LOG } from '../control/worker-heartbeat.service';
 import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
@@ -22,6 +24,7 @@ import { TradesService } from '../trades/trades.service';
 import { generateClientOrderId } from './client-order-id.util';
 import { EVALUATION_CHECKPOINT_STORE } from './evaluation-checkpoint.store';
 import type { EvaluationCheckpointStore } from './evaluation-checkpoint.store';
+import { buildSnapshot, SnapshotLabels } from './evaluation-snapshot.util';
 import { ReconciliationService } from './reconciliation.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
@@ -41,6 +44,12 @@ export type CycleOutcome =
   /** A newly closed candle was evaluated; missedCandles = closed candles skipped while the worker was down. */
   | { status: 'evaluated'; candleCloseTime: number; missedCandles: number };
 
+/** What evaluating a candle came to: the last signal the strategy gave and what was done with it. */
+interface CandleResult {
+  signal: Signal | null;
+  decision: EvaluationSnapshot['decision'];
+}
+
 /**
  * SIGNAL → RISK → ENTRY → POSITION → EXIT → PNL → EVENT, identical for LONG and SHORT: the side
  * only decides which order opens/closes the position (BUY/SELL) and the sign of the pnl.
@@ -52,6 +61,8 @@ export class ExecutionService {
   private readonly lastProcessedCloseTime = new Map<string, number>();
   /** Symbols whose current cycle already sent an order — such a cycle must not be retried. */
   private readonly ordersPlacedInCycle = new Set<string>();
+  /** Symbols whose stored market-data error (if any) was already cleared by a successful fetch. */
+  private readonly symbolsWithoutError = new Set<string>();
 
   constructor(
     @Inject(EXCHANGE_GATEWAY) private readonly gateway: ExchangeGateway,
@@ -70,6 +81,9 @@ export class ExecutionService {
     @Inject(executionConfig.KEY) private readonly config: ReturnType<typeof executionConfig>,
     @Inject(riskConfig.KEY) private readonly riskConfigValues: ReturnType<typeof riskConfig>,
     @Inject(EVALUATION_CHECKPOINT_STORE) private readonly checkpoints: EvaluationCheckpointStore,
+    @Optional()
+    @Inject(EVALUATION_SNAPSHOT_STORE)
+    private readonly snapshots: EvaluationSnapshotStore = new InMemoryEvaluationSnapshotStore(),
   ) {}
 
   /**
@@ -88,6 +102,7 @@ export class ExecutionService {
     );
     const lastCandle = candles[candles.length - 1];
     if (!lastCandle) return { status: 'no-candles' };
+    await this.clearSymbolError(symbol);
 
     const dedupeKey = `${mode}:${symbol}`;
     if (this.lastProcessedCloseTime.get(dedupeKey) === lastCandle.closeTime) {
@@ -100,6 +115,8 @@ export class ExecutionService {
       // Committed before = done for good. Otherwise another live process holds it: ask again next tick.
       if (claim.previousCloseTime !== null && claim.previousCloseTime >= lastCandle.closeTime) {
         this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
+        // First sight of this candle in this process (a restart): make sure the dashboard has it.
+        await this.reconcileSnapshot(symbol, strategy, mode, candles, lastCandle);
       }
       return { status: 'already-evaluated', candleCloseTime: lastCandle.closeTime };
     }
@@ -110,10 +127,12 @@ export class ExecutionService {
       `${WORKER_LOG} evaluating symbol=${symbol} candleClose=${new Date(lastCandle.closeTime).toISOString()} ` +
         `missedCandles=${missed.length}`,
     );
+    if (missed.length > 0) this.reportGap(symbol, mode, previous!, missed, lastCandle);
 
     this.ordersPlacedInCycle.delete(symbol);
+    let result: CandleResult;
     try {
-      await this.evaluateCandle(symbol, strategy, mode, candles, lastCandle, missed);
+      result = await this.evaluateCandle(symbol, strategy, mode, candles, lastCandle, missed);
     } catch (err) {
       if (this.ordersPlacedInCycle.has(symbol)) {
         // An order already went out: retrying could send it twice. Mark the candle done instead.
@@ -133,7 +152,100 @@ export class ExecutionService {
 
     this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
     await this.commitCheckpoint(checkpointKey, lastCandle.closeTime);
+    await this.saveSnapshot(buildSnapshot({ mode, symbol, candle: lastCandle, ...result, source: 'cycle', labels: this.labels }));
     return { status: 'evaluated', candleCloseTime: lastCandle.closeTime, missedCandles: missed.length };
+  }
+
+  /**
+   * Restart on a candle a previous run already evaluated: the stored snapshot is reused when it
+   * covers this candle; otherwise (none stored yet) the strategy — a pure function — is re-run
+   * purely to inform the dashboard. Never reaches risk, orders or positions, so it can't trade.
+   */
+  private async reconcileSnapshot(
+    symbol: string,
+    strategy: ReturnType<StrategyRegistryService['get']>,
+    mode: TradeMode,
+    candles: Candle[],
+    lastCandle: Candle,
+  ): Promise<void> {
+    try {
+      const stored = await this.snapshots.get(mode, symbol);
+      if (stored?.snapshot && stored.snapshot.candleCloseTime >= lastCandle.closeTime) return;
+
+      const regimeCandles = await this.fetchRegimeCandles(symbol);
+      // Read-only, so an open position is judged on its exit rules as the real cycle did.
+      const openTrade = await this.tradesService.findOpenPosition(symbol, mode);
+      const openPosition: StrategyContext['openPosition'] = openTrade
+        ? { side: openTrade.side === 'SHORT' ? 'SHORT' : 'LONG', entryPrice: openTrade.entryPrice, stopLoss: openTrade.stopLoss }
+        : null;
+      const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, openPosition);
+      const decision = {
+        outcome: 'INFORMATIONAL' as const,
+        reason: 'Candle já processado antes do reinício; avaliação apenas informativa (nenhuma ordem enviada)',
+      };
+      await this.saveSnapshot(
+        buildSnapshot({ mode, symbol, candle: lastCandle, signal, decision, source: 'reconciliation', labels: this.labels }),
+      );
+      this.logger.log(
+        `${WORKER_LOG} reconciliation symbol=${symbol} candleClose=${new Date(lastCandle.closeTime).toISOString()} ` +
+          `signal=${signal ? signal.action : 'SKIP'} (informational, no orders)`,
+      );
+    } catch (err) {
+      // Informational only: a failure here never affects the loop (the next candle stores a real one).
+      this.logger.warn(`${WORKER_LOG} reconciliation_failed symbol=${symbol} error="${(err as Error).message}"`);
+    }
+  }
+
+  /** Candles closed while the worker was down: logged and stored as an event, never traded retroactively. */
+  private reportGap(symbol: string, mode: TradeMode, previousCloseTime: number, missed: Candle[], lastCandle: Candle): void {
+    const payload = {
+      symbol,
+      mode,
+      timeframe: this.strategyConfig.timeframe,
+      missedCandles: missed.length,
+      lastEvaluatedCandleClose: new Date(previousCloseTime).toISOString(),
+      firstMissedCandleClose: new Date(missed[0].closeTime).toISOString(),
+      lastMissedCandleClose: new Date(missed[missed.length - 1].closeTime).toISOString(),
+      evaluatedCandleClose: new Date(lastCandle.closeTime).toISOString(),
+    };
+    this.logger.warn(
+      `${WORKER_LOG} evaluation_gap symbol=${symbol} missedCandles=${missed.length} ` +
+        `from=${payload.firstMissedCandleClose} to=${payload.lastMissedCandleClose} - only the latest candle is evaluated`,
+    );
+    this.eventEmitter.emit('worker.gap', payload);
+  }
+
+  private get labels(): SnapshotLabels {
+    const c = this.strategyConfig;
+    return { emaFast: c.emaFast, emaSlow: c.emaSlow, emaRegime: c.emaRegime, timeframe: c.timeframe, regimeTimeframe: c.regimeTimeframe };
+  }
+
+  /** Dashboard state only: a failed write is logged and never fails the cycle. */
+  private async saveSnapshot(snapshot: EvaluationSnapshot): Promise<void> {
+    try {
+      if (await this.snapshots.save(snapshot)) this.symbolsWithoutError.add(snapshot.symbol);
+    } catch (err) {
+      this.logger.warn(`${WORKER_LOG} snapshot_save_failed symbol=${snapshot.symbol} error="${(err as Error).message}"`);
+    }
+  }
+
+  /** Once per process and recovery: the fetch worked, so a stored market-data error is over. */
+  private async clearSymbolError(symbol: string): Promise<void> {
+    if (this.symbolsWithoutError.has(symbol)) return;
+    try {
+      await this.snapshots.clearError(this.trading.mode, symbol);
+      this.symbolsWithoutError.add(symbol);
+    } catch (err) {
+      this.logger.warn(`${WORKER_LOG} snapshot_clear_error_failed symbol=${symbol} error="${(err as Error).message}"`);
+    }
+  }
+
+  /** Shown on the dashboard until the next successful fetch clears it; best-effort. */
+  private async recordSymbolError(symbol: string, message: string): Promise<void> {
+    this.symbolsWithoutError.delete(symbol);
+    await this.snapshots
+      .recordError(this.trading.mode, symbol, message)
+      .catch((e: Error) => this.logger.warn(`${WORKER_LOG} snapshot_error_save_failed symbol=${symbol} error="${e.message}"`));
   }
 
   private async commitCheckpoint(key: string, closeTime: number): Promise<void> {
@@ -153,17 +265,12 @@ export class ExecutionService {
     candles: Candle[],
     lastCandle: Candle,
     missed: Candle[],
-  ): Promise<void> {
-    const regimeCandles =
-      this.strategyConfig.regimeTimeframe === this.strategyConfig.timeframe
-        ? undefined
-        : await this.fetchClosedCandles(
-            symbol,
-            this.strategyConfig.regimeTimeframe,
-            this.strategyConfig.emaRegime + 10,
-          );
+  ): Promise<CandleResult> {
+    const regimeCandles = await this.fetchRegimeCandles(symbol);
 
     let openTrade = await this.tradesService.findOpenPosition(symbol, mode);
+    let lastSignal: Signal | null = null;
+    let decision: CandleResult['decision'] = { outcome: 'NOT_ENTERED', reason: '' };
 
     if (openTrade) {
       if (mode === 'PAPER') {
@@ -177,6 +284,7 @@ export class ExecutionService {
           );
           if (intraExit) {
             await this.closePaperPosition(openTrade, intraExit.exitPrice, c.closeTime, intraExit.reason);
+            decision = { outcome: 'EXITED', reason: `Posição fechada por ${intraExit.reason} dentro do candle` };
             openTrade = null;
             break;
           }
@@ -190,9 +298,13 @@ export class ExecutionService {
           stopLoss: openTrade.stopLoss,
         });
         this.logCycle(symbol, signal);
+        lastSignal = signal;
         if (signal?.action === 'EXIT') {
           await this.exitPosition(openTrade, signal.price, lastCandle.closeTime, 'SIGNAL', mode, symbol, signal.reason);
+          decision = { outcome: 'EXITED', reason: signal.reason };
           openTrade = null;
+        } else {
+          decision = { outcome: 'IN_POSITION', reason: 'Posição aberta, sem gatilho de saída' };
         }
       }
     }
@@ -200,10 +312,26 @@ export class ExecutionService {
     if (!openTrade) {
       const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, null);
       this.logCycle(symbol, signal);
+      lastSignal = signal;
       if (signal && sideFromSignal(signal.action)) {
-        await this.tryEnter(signal, symbol, mode, lastCandle);
+        const entry = await this.tryEnter(signal, symbol, mode, lastCandle);
+        decision = entry.entered
+          ? { outcome: 'ENTERED', reason: signal.reason }
+          : { outcome: 'NOT_ENTERED', reason: `Sinal vetado pelo risco: ${entry.rejectReason}` };
+      } else if (decision.outcome !== 'EXITED') {
+        decision = signal
+          ? { outcome: 'NOT_ENTERED', reason: signal.reason }
+          : { outcome: 'SKIPPED', reason: 'Estratégia sem histórico suficiente ou falhou ao avaliar' };
       }
     }
+    return { signal: lastSignal, decision };
+  }
+
+  /** Higher-timeframe candles for the regime filter; undefined when it is the strategy timeframe. */
+  private async fetchRegimeCandles(symbol: string): Promise<Candle[] | undefined> {
+    return this.strategyConfig.regimeTimeframe === this.strategyConfig.timeframe
+      ? undefined
+      : this.fetchClosedCandles(symbol, this.strategyConfig.regimeTimeframe, this.strategyConfig.emaRegime + 10);
   }
 
   /** Logs signal=HOLD/ENTER_LONG/ENTER_SHORT/EXIT/SKIP + reason every cycle, not just entries/exits. */
@@ -227,7 +355,12 @@ export class ExecutionService {
     });
   }
 
-  private async tryEnter(signal: Signal, symbol: string, mode: TradeMode, lastCandle: Candle): Promise<void> {
+  private async tryEnter(
+    signal: Signal,
+    symbol: string,
+    mode: TradeMode,
+    lastCandle: Candle,
+  ): Promise<{ entered: boolean; rejectReason?: string }> {
     const side = sideFromSignal(signal.action)!;
     const riskCtx = await this.riskContextBuilder.build(
       this.gateway,
@@ -241,7 +374,7 @@ export class ExecutionService {
 
     if (!decision.approved || !decision.qty) {
       this.logger.warn(`Cycle ${symbol}: ${side} entry rejected by risk (${decision.rejectReason})`);
-      return;
+      return { entered: false, rejectReason: decision.rejectReason ?? 'sem quantidade aprovada' };
     }
 
     const orderSide = entryOrderSide(side);
@@ -310,6 +443,7 @@ export class ExecutionService {
     if (this.gateway.kind === 'BINANCE') {
       await this.placeStopOrRescue(tradeDoc, symbol, side, decision.qty, signal.stopLoss!, mode, lastCandle);
     }
+    return { entered: true };
   }
 
   private async placeStopOrRescue(
@@ -470,6 +604,7 @@ export class ExecutionService {
     try {
       candles = await this.gateway.getCandles({ symbol, interval, limit: limit + 2 });
     } catch (err) {
+      await this.recordSymbolError(symbol, `Falha ao buscar candles ${interval} na exchange: ${(err as Error).message}`);
       // Tagged so the incident layer reports "Binance API" rather than a generic cycle failure.
       throw new MarketDataError((err as Error).message, err);
     }

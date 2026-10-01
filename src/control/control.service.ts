@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Model } from 'mongoose';
@@ -9,6 +9,8 @@ import { generateClientOrderId } from '../execution/client-order-id.util';
 import { exitOrderSide } from '../trades/position-math.util';
 import { TRADE_CLOSED } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
+import { EVALUATION_SNAPSHOT_STORE, InMemoryEvaluationSnapshotStore } from './evaluation-snapshot.store';
+import type { EvaluationSnapshot, EvaluationSnapshotStore } from './evaluation-snapshot.store';
 import { RuntimeStatusService, SignalSnapshot } from './runtime-status.service';
 import { BotState, BotStateDocument } from './schemas/bot-state.schema';
 import { WorkerHeartbeatService, WorkerStatus } from './worker-heartbeat.service';
@@ -40,7 +42,10 @@ export interface BotStatus {
   lastPollAt: Date | null;
   executionEnabled: boolean;
   pollIntervalSeconds: number;
+  /** Latest persisted evaluation per symbol (survives restarts; see evaluation_snapshots). */
   lastSignalBySymbol: Record<string, SignalSnapshot>;
+  /** Symbols whose last market-data fetch failed, until a fetch succeeds again. */
+  symbolErrors: Record<string, { message: string; at: Date }>;
   openTrades: number;
   equity: number;
   lastError: string | null;
@@ -64,6 +69,9 @@ export class ControlService {
     @Inject(tradingConfig.KEY) private readonly trading: ReturnType<typeof tradingConfig>,
     private readonly eventEmitter: EventEmitter2,
     @Inject(executionConfig.KEY) private readonly execution: ReturnType<typeof executionConfig>,
+    @Optional()
+    @Inject(EVALUATION_SNAPSHOT_STORE)
+    private readonly snapshots: EvaluationSnapshotStore = new InMemoryEvaluationSnapshotStore(),
   ) {}
 
   async getState(): Promise<BotState> {
@@ -73,12 +81,31 @@ export class ControlService {
   /** Everything GET /bot/status needs: persisted bot_state + live execution/runtime info. */
   async getStatus(): Promise<BotStatus> {
     const mode = this.trading.mode;
-    const [state, openTrades, balance, worker] = await Promise.all([
+    const [state, openTrades, balance, worker, stored] = await Promise.all([
       this.getOrCreateState(),
       this.tradesService.countOpenPositions(mode),
       this.gateway.getBalance(QUOTE_ASSET).catch(() => null),
       this.workerHeartbeat.getStatus(),
+      this.snapshots.list(mode).catch((err: Error) => {
+        this.logger.warn(`Could not read evaluation snapshots: ${err.message}`);
+        return [];
+      }),
     ]);
+
+    const lastSignalBySymbol: Record<string, SignalSnapshot> = {};
+    const symbolErrors: BotStatus['symbolErrors'] = {};
+    let lastEvaluationAt: Date | null = null;
+    let lastCycleAt: Date | null = null;
+    for (const s of stored) {
+      if (s.lastError && s.lastErrorAt) symbolErrors[s.symbol] = { message: s.lastError, at: s.lastErrorAt };
+      if (!s.snapshot) continue;
+      lastSignalBySymbol[s.symbol] = toSignalSnapshot(s.snapshot);
+      const at = s.snapshot.evaluatedAt;
+      if (!lastEvaluationAt || at > lastEvaluationAt) lastEvaluationAt = at;
+      if (s.snapshot.source === 'cycle' && (!lastCycleAt || at > lastCycleAt)) lastCycleAt = at;
+    }
+    const runtimeCycleAt = this.runtimeStatus.getLastCycleAt();
+    if (runtimeCycleAt && (!lastCycleAt || runtimeCycleAt > lastCycleAt)) lastCycleAt = runtimeCycleAt;
 
     return {
       mode,
@@ -87,15 +114,17 @@ export class ControlService {
       pauseReason: state.isPaused ? state.pauseReason : undefined,
       lastReconciliationAt: state.lastReconciliationAt,
       lastReconciliationOk: state.lastReconciliationOk,
-      lastCycleAt: this.runtimeStatus.getLastCycleAt(),
+      lastCycleAt,
       lastPollAt: this.runtimeStatus.getLastPollAt(),
       executionEnabled: this.execution.enabled,
       pollIntervalSeconds: this.execution.pollIntervalSeconds,
-      lastSignalBySymbol: this.runtimeStatus.getLastSignalBySymbol(),
+      lastSignalBySymbol,
+      symbolErrors,
       openTrades,
       equity: balance?.free ?? 0,
       lastError: this.runtimeStatus.getLastError(),
-      worker,
+      // Same source as lastSignalBySymbol, so the worker card and the per-symbol panel always agree.
+      worker: lastEvaluationAt ? { ...worker, lastEvaluationAt } : worker,
     };
   }
 
@@ -198,4 +227,20 @@ export class ControlService {
     if (existing) return existing;
     return this.stateModel.create({ isPaused: false, lastReconciliationOk: true, updatedAt: new Date() });
   }
+}
+
+function toSignalSnapshot(s: EvaluationSnapshot): SignalSnapshot {
+  return {
+    action: s.action,
+    reason: s.reason,
+    at: s.evaluatedAt,
+    candleTime: new Date(s.candleCloseTime).toISOString(),
+    candleOpenTime: new Date(s.candleOpenTime).toISOString(),
+    ...(s.price !== undefined ? { price: s.price } : {}),
+    indicators: s.indicators,
+    source: s.source,
+    ...(s.side ? { side: s.side } : {}),
+    ...(s.conditions ? { conditions: s.conditions } : {}),
+    decision: s.decision,
+  };
 }

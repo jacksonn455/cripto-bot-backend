@@ -107,6 +107,12 @@ export class EventsService {
     this.push('worker.started', payload, { withMode: true });
   }
 
+  /** Closed candles skipped while the worker was down (only the latest one was evaluated). */
+  @OnEvent('worker.gap')
+  onWorkerGap(payload: unknown): void {
+    this.push('worker.gap', payload);
+  }
+
   @OnEvent('worker.stalled')
   onWorkerStalled(payload: unknown): void {
     this.push('worker.stalled', payload, { withMode: true });

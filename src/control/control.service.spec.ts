@@ -1,5 +1,6 @@
 import { TradesService } from '../trades/trades.service';
 import { ControlService } from './control.service';
+import { InMemoryEvaluationSnapshotStore } from './evaluation-snapshot.store';
 
 function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } = {}) {
   const state: Record<string, unknown> = { isPaused: false };
@@ -162,5 +163,83 @@ describe('ControlService', () => {
       expect.objectContaining({ exitReason: 'KILL_SWITCH', exitPrice: 95, pnl: 10, pnlPct: 5 }),
     );
     expect(eventEmitter.emit).toHaveBeenCalledWith('trade.closed', expect.objectContaining({ side: 'SHORT', reason: 'KILL_SWITCH' }));
+  });
+});
+
+describe('ControlService.getStatus - persisted evaluations', () => {
+  const HOUR = 3_600_000;
+  const base = {
+    mode: 'PAPER',
+    timeframe: '1h',
+    regimeTimeframe: '4h',
+    source: 'cycle' as const,
+    action: 'HOLD',
+    reason: 'sem cruzamento EMA rapida/lenta',
+    price: 64_000,
+    indicators: { emaFast: 63_900, emaSlow: 64_100, emaRegime: 61_000, rsi: 55 },
+    decision: { outcome: 'NOT_ENTERED' as const, reason: 'sem cruzamento EMA rapida/lenta' },
+  };
+
+  function makeStatusService(snapshots: InMemoryEvaluationSnapshotStore, heartbeatLastEvaluationAt: Date | null) {
+    return new ControlService(
+      { findOne: jest.fn().mockResolvedValue({ isPaused: false, lastReconciliationOk: true }) } as never,
+      { getBalance: jest.fn().mockResolvedValue({ free: 1000 }) } as never,
+      { countOpenPositions: jest.fn().mockResolvedValue(0) } as never,
+      {
+        getLastCycleAt: jest.fn().mockReturnValue(null),
+        getLastError: jest.fn().mockReturnValue(null),
+        getLastPollAt: jest.fn().mockReturnValue(null),
+      } as never,
+      { getStatus: jest.fn().mockResolvedValue({ state: 'ONLINE', lastEvaluationAt: heartbeatLastEvaluationAt }) } as never,
+      { mode: 'PAPER' } as never,
+      { emit: jest.fn() } as never,
+      { enabled: true, pollIntervalSeconds: 60 } as never,
+      snapshots,
+    );
+  }
+
+  it('the worker card and the per-symbol panel show the same evaluation time, from the same snapshots', async () => {
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    const btcAt = new Date('2026-10-01T16:00:31Z');
+    const ethAt = new Date('2026-10-01T16:00:33Z');
+    await snapshots.save({ ...base, symbol: 'BTCUSDT', candleOpenTime: 15 * HOUR, candleCloseTime: 16 * HOUR - 1, evaluatedAt: btcAt });
+    await snapshots.save({ ...base, symbol: 'ETHUSDT', candleOpenTime: 15 * HOUR, candleCloseTime: 16 * HOUR - 1, evaluatedAt: ethAt });
+    // The heartbeat document says something else (e.g. a tick time carried from the previous run).
+    const status = await makeStatusService(snapshots, new Date('2026-10-01T15:00:30Z')).getStatus();
+
+    expect(status.worker.lastEvaluationAt).toEqual(ethAt);
+    expect(status.lastSignalBySymbol.ETHUSDT.at).toEqual(ethAt);
+    expect(status.lastSignalBySymbol.BTCUSDT).toMatchObject({
+      at: btcAt,
+      action: 'HOLD',
+      candleTime: new Date(16 * HOUR - 1).toISOString(),
+      candleOpenTime: new Date(15 * HOUR).toISOString(),
+      source: 'cycle',
+      indicators: base.indicators,
+    });
+    expect(status.lastCycleAt).toEqual(ethAt);
+  });
+
+  it('reports market-data errors per symbol, and falls back to the heartbeat when nothing is stored', async () => {
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    const errorAt = new Date('2026-10-01T16:01:00Z');
+    await snapshots.recordError('PAPER', 'BTCUSDT', 'HTTP 451', errorAt);
+    const heartbeatAt = new Date('2026-10-01T15:00:30Z');
+
+    const status = await makeStatusService(snapshots, heartbeatAt).getStatus();
+
+    expect(status.lastSignalBySymbol).toEqual({});
+    expect(status.symbolErrors).toEqual({ BTCUSDT: { message: 'HTTP 451', at: errorAt } });
+    expect(status.worker.lastEvaluationAt).toEqual(heartbeatAt);
+  });
+
+  it('still answers when the snapshot store is unreachable', async () => {
+    const snapshots = new InMemoryEvaluationSnapshotStore();
+    jest.spyOn(snapshots, 'list').mockRejectedValue(new Error('Mongo down'));
+
+    const status = await makeStatusService(snapshots, null).getStatus();
+
+    expect(status.lastSignalBySymbol).toEqual({});
+    expect(status.worker.state).toBe('ONLINE');
   });
 });
