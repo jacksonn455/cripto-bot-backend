@@ -1,5 +1,7 @@
 node_modules/
 dist/
+dist.prev/
+.deploy-state/
 coverage/
 *.tsbuildinfo
 

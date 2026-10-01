@@ -10,7 +10,8 @@ atrás do Nginx. O dashboard continua na Vercel e chama a API pelo servidor (`/a
 | Diretório | `/home/ubuntu/krypto/backend` |
 | Processo | `krypto-backend` → `127.0.0.1:8000` (fork, 1 instância) |
 | Monitoramento | `krypto-watchdog` (PM2, a cada 5 min) + monitor externo em `/health` (seção 8) + GitHub Actions `heartbeat-watchdog` (opcional, só manual por enquanto) |
-| Arquivos | [`ecosystem.config.js`](../ecosystem.config.js), [`scripts/deploy.sh`](../scripts/deploy.sh), [`.env.example`](../.env.example) |
+| Deploy | automático: cron na VM a cada 5 min busca a `master` e roda o `deploy.sh` quando há commit novo (seção 10) |
+| Arquivos | [`ecosystem.config.js`](../ecosystem.config.js), [`scripts/deploy.sh`](../scripts/deploy.sh), [`scripts/auto-deploy.sh`](../scripts/auto-deploy.sh), [`.env.example`](../.env.example) |
 
 > **Nunca rode dois workers.** Com o Render e a VM ativos ao mesmo tempo, cada candle é avaliado e
 > operado duas vezes no mesmo banco. Siga a ordem do passo 4 (suspender o Render antes de subir o PM2).
@@ -124,6 +125,12 @@ O script faz `git pull --ff-only` (branch `master`, ou `DEPLOY_BRANCH`), `pnpm i
 build com o heap limitado, `pm2 startOrReload` e `pm2 save`. Depois espera o `/health` responder, por até 60 s,
 e falha se o processo não subir, se o loop travar (503) ou se o MongoDB estiver inacessível (`"status":"down"`).
 
+Se o build falhar, o script restaura o build anterior em `dist/` e não mexe no processo em execução, então
+um restart posterior do PM2 continua subindo a versão que estava no ar.
+
+Com o deploy automático instalado (seção 10), basta fazer push na `master`. O comando acima continua valendo
+para forçar um deploy, por exemplo depois de uma falha.
+
 Em fork mode, o reload é um restart: o processo recebe SIGINT, para o poller, grava `stopped` no
 heartbeat e fecha Mongo/Redis (`kill_timeout` de 10 s) antes de subir o novo.
 
@@ -233,6 +240,9 @@ Configure um monitor HTTP gratuito de fora da Oracle:
   (sem `*`) só se isso mudar.
 - [ ] `TRADING_MODE=PAPER` e `LIVE_TRADING_CONFIRMED=false`
 
+**Deploy automático**
+- [ ] `scripts/install-auto-deploy.sh` rodado na VM e `crontab -l` mostrando `# krypto-auto-deploy` (seção 10)
+
 **Monitor externo**
 - [ ] UptimeRobot ou Better Stack apontando para `https://<seu-domínio>/health` (seção 8)
 
@@ -254,35 +264,42 @@ O GitHub pausa schedules depois de 60 dias sem atividade no repositório.
 - [ ] Web service e cron job suspensos ou apagados. A configuração antiga está em `docs/legacy/render.yaml`,
   só como referência.
 
-## 10. CI/CD por SSH (documentado, ainda não implementado)
+## 10. Deploy automático (pull na VM)
 
-Quando o deploy manual estiver estável, dá para disparar o `scripts/deploy.sh` a cada push na `master`:
+A VM consulta o GitHub a cada 5 min e, quando a `master` tem commit novo, roda o `scripts/deploy.sh`.
+O resultado chega no Discord: **🚀 Deploy concluído**, com os commits e a duração, ou **💥 Deploy falhou**,
+com a etapa e as últimas linhas do log, já mascaradas. Quem inicia a conexão é a VM, então nenhuma porta é
+aberta e nenhuma chave fica no GitHub. A porta 22 pode continuar restrita ao seu IP.
 
-1. Na sua máquina, gere uma chave só para deploy: `ssh-keygen -t ed25519 -f krypto_deploy -C github-deploy`.
-2. Na VM, adicione `krypto_deploy.pub` ao `~/.ssh/authorized_keys` do `ubuntu`.
-3. No GitHub, crie os secrets `ORACLE_HOST` (`137.131.162.89`), `ORACLE_USER` (`ubuntu`) e
-   `ORACLE_SSH_KEY` (o conteúdo da chave **privada**). Nunca coloque a chave no repositório.
-4. Crie `.github/workflows/deploy.yml`:
+Instalação, uma vez, na VM:
 
-```yaml
-name: deploy
-on:
-  push:
-    branches: [master]
-concurrency:
-  group: deploy
-  cancel-in-progress: false
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.ORACLE_HOST }}
-          username: ${{ secrets.ORACLE_USER }}
-          key: ${{ secrets.ORACLE_SSH_KEY }}
-          script: bash /home/ubuntu/krypto/backend/scripts/deploy.sh
+```bash
+bash /home/ubuntu/krypto/backend/scripts/install-auto-deploy.sh
+crontab -l    # deve mostrar a linha "# krypto-auto-deploy"
 ```
 
-A porta 22 precisa aceitar os IPs dos runners do GitHub, que não são fixos. Isso conflita com restringir o SSH ao
-seu IP. Por isso o deploy continua manual por enquanto.
+O instalador grava no crontab o `PATH` atual (cron roda com PATH mínimo e não acharia `node`/`pm2`/`corepack`
+instalados via nvm). Rodar de novo atualiza a entrada. `--remove` desinstala, e `AUTO_DEPLOY_INTERVAL_MINUTES`
+muda o intervalo.
+
+Como funciona ([`scripts/auto-deploy.sh`](../scripts/auto-deploy.sh)):
+
+- `git fetch` e compara `HEAD` com `origin/master`. Sem commit novo, sai sem fazer nada nem logar.
+- Um deploy por vez (`flock`): um build lento nunca roda em paralelo com o próximo tick.
+- Cada deploy grava `logs/deploy-<data>-<sha>.log` (ficam os 30 mais recentes). O resumo vai para `logs/auto-deploy.log`.
+- Um commit que falhou **não** é tentado de novo a cada 5 min (o sha fica em `.deploy-state/failed-sha`). O
+  próximo commit tenta outra vez, ou rode `bash scripts/deploy.sh` à mão.
+- Pausar: `touch .deploy-state/paused`. Retomar: `rm .deploy-state/paused`.
+- O aviso no Discord usa o mesmo webhook e as mesmas chaves dos alertas operacionais (`DISCORD_ENABLED=true`,
+  `DISCORD_ALERTS_ENABLED`). É JavaScript puro ([`scripts/deploy-notify.js`](../scripts/deploy-notify.js)), então
+  funciona mesmo quando o build falha.
+- Mudanças feitas à mão na VM fazem o `git pull --ff-only` falhar, e isso aparece como deploy falho. Não edite
+  arquivos versionados na VM, só o `.env`.
+- O deploy não cria variáveis novas no `.env`. Quando um commit precisar de uma, edite o `.env` da VM antes do
+  push, porque o restart do deploy já carrega o arquivo. Se esquecer, edite depois e rode `pm2 restart krypto-backend`.
+
+Cada deploy reinicia o worker por alguns segundos. Ele grava `stopped` no heartbeat, e na volta reavalia o último
+candle fechado sem repetir operações.
+
+Alternativa descartada: GitHub Actions por SSH (`appleboy/ssh-action` rodando o `deploy.sh`). Os runners do
+GitHub não têm IP fixo, então a porta 22 precisaria aceitar a internet inteira.

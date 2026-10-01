@@ -33,8 +33,18 @@ step "install dependencies (frozen lockfile)"
 "${PNPM[@]}" install --frozen-lockfile
 
 step "build (heap capped for the 1 GB VM)"
-NODE_OPTIONS=--max-old-space-size=768 "${PNPM[@]}" run build
-[ -f dist/main.js ] || fail "build finished but dist/main.js is missing"
+# nest build wipes dist/ first (deleteOutDir). Keep the previous build so a failed one never leaves
+# PM2 without dist/main.js: the running worker would survive, but its next restart would not.
+rm -rf dist.prev
+if [ -f dist/main.js ]; then cp -a dist dist.prev; fi
+restore_previous_build() {
+  if [ -d dist.prev ]; then rm -rf dist && mv dist.prev dist && echo "previous build restored to dist/" >&2; fi
+}
+if ! NODE_OPTIONS=--max-old-space-size=768 "${PNPM[@]}" run build || [ ! -f dist/main.js ]; then
+  restore_previous_build
+  fail "build failed (the running process was not touched)"
+fi
+rm -rf dist.prev
 
 step "pm2 startOrReload"
 mkdir -p logs
