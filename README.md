@@ -231,7 +231,8 @@ curl http://localhost:8000/bot/status
 
 That starts Krypto in `PAPER` mode (the default), with simulated money and real prices. For
 everything else (other commands, endpoints, architecture, technical decisions) see
-[docs/TECNICO.md](docs/TECNICO.md).
+[docs/TECNICO.md](docs/TECNICO.md). Production runs on an Oracle Cloud VM with PM2:
+[docs/DEPLOY_ORACLE.md](docs/DEPLOY_ORACLE.md) (in Portuguese).
 
 ---
 
