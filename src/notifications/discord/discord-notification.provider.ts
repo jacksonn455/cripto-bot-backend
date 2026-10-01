@@ -45,6 +45,8 @@ export class DiscordNotificationProvider implements NotificationProvider, OnModu
   }
 
   accepts(notification: Notification): boolean {
+    // Operational incidents have their own switch, independent of DISCORD_EVENTS (trades/alerts).
+    if (notification.kind === 'ops') return this.config.discordAlertsEnabled;
     return this.config.discordEvents.includes(categoryOf(notification));
   }
 

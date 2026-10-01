@@ -8,6 +8,7 @@ import {
   type NotificationProvider,
 } from './notification.types';
 
+
 /**
  * Reacts to domain events emitted elsewhere (execution, reconciliation, control) and fans them
  * out to every enabled channel — trading code never knows whether/how alerts get delivered.
@@ -71,6 +72,7 @@ export class NotificationsService implements OnModuleInit {
 
   private summary(notification: Notification): string {
     if (notification.kind === 'alert') return `: ${notification.message}`;
+    if (notification.kind === 'ops') return `: ${notification.notice.headline} - ${notification.notice.summary}`;
     if (notification.kind === 'trade.opened') return ` @ ${notification.trade.entryPrice}`;
     return ` pnl=${notification.trade.pnl.toFixed(2)} (${notification.trade.reason})`;
   }

@@ -232,3 +232,63 @@ describe('buildDiscordPayload', () => {
     expect(embed.title).toBe('🚨 Alerta crítico');
   });
 });
+
+describe('Discord operational incidents (same webhook as trades)', () => {
+  const INCIDENT: Notification = {
+    kind: 'ops',
+    notice: {
+      phase: 'incident',
+      headline: 'INCIDENT',
+      summary: 'Binance API (market data) · BTCUSDT: timeout',
+      severity: 'warning',
+      fields: [
+        ['Componente', 'Binance API (market data)'],
+        ['Status', 'DEGRADED'],
+      ],
+      incidentKey: 'MARKET_DATA:BTCUSDT',
+      at: '2026-10-01T05:41:18.000Z',
+    },
+  };
+  const TRADE: Notification = { kind: 'trade.opened', trade: OPENED };
+
+  beforeEach(() => {
+    for (const level of ['log', 'warn', 'error'] as const) jest.spyOn(Logger.prototype, level).mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('accepts incidents by default, through the same provider/webhook as trades', () => {
+    const p = makeProvider({ discordAlertsEnabled: true });
+    expect(p.accepts(INCIDENT)).toBe(true);
+    expect(p.accepts(TRADE)).toBe(true);
+  });
+
+  it('DISCORD_ALERTS_ENABLED=false: trades keep flowing, incidents are not sent', () => {
+    const p = makeProvider({ discordAlertsEnabled: false });
+    expect(p.accepts(TRADE)).toBe(true);
+    expect(p.accepts(INCIDENT)).toBe(false);
+  });
+
+  it('DISCORD_ENABLED=false: no request to Discord at all', async () => {
+    const fetchSpy = jest.spyOn(global, 'fetch');
+    const p = makeProvider({ discordEnabled: false, discordAlertsEnabled: true });
+    await expect(p.send(INCIDENT)).resolves.toEqual({ delivered: false, error: 'disabled' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('renders incident / recovery / restart embeds consistent with the trade embeds', () => {
+    const incident = buildDiscordPayload(INCIDENT, 'Trade Bot').embeds[0];
+    expect(incident.title).toBe('⚠️ KRYPTO — INCIDENT');
+    expect(incident.fields).toEqual([
+      { name: 'Componente', value: 'Binance API (market data)', inline: true },
+      { name: 'Status', value: 'DEGRADED', inline: true },
+    ]);
+    expect(incident.footer?.text).toBe('incidente MARKET_DATA:BTCUSDT');
+
+    const critical = buildDiscordPayload({ kind: 'ops', notice: { ...(INCIDENT as Extract<Notification, { kind: 'ops' }>).notice, severity: 'critical', headline: 'WORKER OFFLINE' } } as Notification).embeds[0];
+    expect(critical.title).toBe('🚨 KRYPTO — WORKER OFFLINE');
+    const recovered = buildDiscordPayload({ kind: 'ops', notice: { ...(INCIDENT as Extract<Notification, { kind: 'ops' }>).notice, phase: 'recovery', headline: 'RECOVERED' } } as Notification).embeds[0];
+    expect(recovered.title).toBe('✅ KRYPTO — RECOVERED');
+    const restarted = buildDiscordPayload({ kind: 'ops', notice: { ...(INCIDENT as Extract<Notification, { kind: 'ops' }>).notice, phase: 'restart', headline: 'RESTARTED' } } as Notification).embeds[0];
+    expect(restarted.title).toBe('🔄 KRYPTO — RESTARTED');
+  });
+});

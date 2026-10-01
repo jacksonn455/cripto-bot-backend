@@ -36,7 +36,11 @@ const COLORS = {
   info: 0x95a5a6,
   warning: 0xf1c40f,
   critical: 0xe74c3c,
+  recovery: 0x2ecc71,
+  restart: 0x3498db,
 };
+
+const OPS_ICONS = { incident: '🚨', recovery: '✅', restart: '🔄' } as const;
 
 const LEVEL_TITLES: Record<NotificationLevel, string> = {
   info: 'ℹ️ Aviso do bot',
@@ -53,6 +57,19 @@ export function buildDiscordPayload(notification: Notification, username?: strin
 }
 
 function buildEmbed(notification: Notification): DiscordEmbed {
+  if (notification.kind === 'ops') {
+    const n = notification.notice;
+    const icon = n.phase === 'incident' && n.severity === 'warning' ? '⚠️' : OPS_ICONS[n.phase];
+    return {
+      title: `${icon} KRYPTO — ${n.headline}`,
+      description: n.summary,
+      color: n.phase === 'recovery' ? COLORS.recovery : n.phase === 'restart' ? COLORS.restart : COLORS[n.severity],
+      fields: n.fields.map(([name, value]) => field(name, value)),
+      footer: { text: `incidente ${n.incidentKey}` },
+      timestamp: n.at,
+    };
+  }
+
   if (notification.kind === 'alert') {
     return {
       title: LEVEL_TITLES[notification.level],

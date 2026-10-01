@@ -17,6 +17,7 @@ import { EventsModule } from './events/events.module';
 import { ExecutionModule } from './execution/execution.module';
 import { FundingModule } from './funding/funding.module';
 import { HealthModule } from './health/health.module';
+import { IncidentsModule } from './incidents/incidents.module';
 import { MarketDataModule } from './market-data/market-data.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { ReportsModule } from './reports/reports.module';
@@ -52,6 +53,7 @@ import { TradesModule } from './trades/trades.module';
     ExecutionModule,
     ControlModule,
     NotificationsModule,
+    IncidentsModule,
     EventsModule,
     FundingModule,
     HealthModule,

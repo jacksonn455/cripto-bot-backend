@@ -77,6 +77,10 @@ export class TelegramNotificationProvider implements NotificationProvider, OnMod
 }
 
 export function formatTelegramText(notification: Notification): string {
+  if (notification.kind === 'ops') {
+    const n = notification.notice;
+    return [`KRYPTO — ${n.headline}`, n.summary, ...n.fields.map(([k, v]) => `${k}: ${v}`)].join('\n');
+  }
   if (notification.kind === 'alert') {
     return `[${notification.level.toUpperCase()}] ${notification.message}`;
   }

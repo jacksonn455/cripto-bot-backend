@@ -4,6 +4,7 @@ import { Interval } from '@nestjs/schedule';
 import { executionConfig, riskConfig, tradingConfig, trendRegimeConfig } from '../config/configuration';
 import { ControlService } from '../control/control.service';
 import { RuntimeStatusService } from '../control/runtime-status.service';
+import { WORKER_INSTANCE_ID, WORKER_LOG } from '../control/worker-heartbeat.service';
 import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import { Candle } from '../exchange/types/candle.type';
@@ -19,9 +20,26 @@ import type { TradeDocument, TradeExitReason, TradeMode, TradeSide } from '../tr
 import { buildTradeOpenedEvent, TRADE_CLOSED, TRADE_OPENED, TradeClosedEvent } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
 import { generateClientOrderId } from './client-order-id.util';
+import { EVALUATION_CHECKPOINT_STORE } from './evaluation-checkpoint.store';
+import type { EvaluationCheckpointStore } from './evaluation-checkpoint.store';
 import { ReconciliationService } from './reconciliation.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
+
+/** Fetching candles from the exchange failed (Binance down, timeout, 451, rate limit...). */
+export class MarketDataError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'MarketDataError';
+  }
+}
+
+export type CycleOutcome =
+  | { status: 'no-candles' }
+  /** Already evaluated (in this process, before a restart, or by an overlapping process right now). */
+  | { status: 'already-evaluated'; candleCloseTime: number }
+  /** A newly closed candle was evaluated; missedCandles = closed candles skipped while the worker was down. */
+  | { status: 'evaluated'; candleCloseTime: number; missedCandles: number };
 
 /**
  * SIGNAL → RISK → ENTRY → POSITION → EXIT → PNL → EVENT, identical for LONG and SHORT: the side
@@ -30,7 +48,10 @@ const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT
 @Injectable()
 export class ExecutionService {
   private readonly logger = new Logger(ExecutionService.name);
+  /** Fast path only (saves a DB round trip per tick); the persisted checkpoint is the source of truth. */
   private readonly lastProcessedCloseTime = new Map<string, number>();
+  /** Symbols whose current cycle already sent an order — such a cycle must not be retried. */
+  private readonly ordersPlacedInCycle = new Set<string>();
 
   constructor(
     @Inject(EXCHANGE_GATEWAY) private readonly gateway: ExchangeGateway,
@@ -48,9 +69,15 @@ export class ExecutionService {
     @Inject(trendRegimeConfig.KEY) private readonly strategyConfig: ReturnType<typeof trendRegimeConfig>,
     @Inject(executionConfig.KEY) private readonly config: ReturnType<typeof executionConfig>,
     @Inject(riskConfig.KEY) private readonly riskConfigValues: ReturnType<typeof riskConfig>,
+    @Inject(EVALUATION_CHECKPOINT_STORE) private readonly checkpoints: EvaluationCheckpointStore,
   ) {}
 
-  async runCycle(symbol: string, strategyName: string): Promise<void> {
+  /**
+   * Evaluates the latest closed candle of `symbol` exactly once. Called every poll tick; only does
+   * work when a new candle has closed. The candle is claimed in evaluation_checkpoints first, so
+   * a restart doesn't re-evaluate it and two overlapping processes can't both act on it.
+   */
+  async runCycle(symbol: string, strategyName: string): Promise<CycleOutcome> {
     const mode = this.trading.mode;
     const strategy = this.strategyRegistry.get(strategyName);
 
@@ -60,12 +87,73 @@ export class ExecutionService {
       this.strategyConfig.emaRegime + 10,
     );
     const lastCandle = candles[candles.length - 1];
-    if (!lastCandle) return;
+    if (!lastCandle) return { status: 'no-candles' };
 
     const dedupeKey = `${mode}:${symbol}`;
-    if (this.lastProcessedCloseTime.get(dedupeKey) === lastCandle.closeTime) return;
-    this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
+    if (this.lastProcessedCloseTime.get(dedupeKey) === lastCandle.closeTime) {
+      return { status: 'already-evaluated', candleCloseTime: lastCandle.closeTime };
+    }
 
+    const checkpointKey = `${mode}:${symbol}:${this.strategyConfig.timeframe}`;
+    const claim = await this.checkpoints.claim(checkpointKey, lastCandle.closeTime, WORKER_INSTANCE_ID);
+    if (!claim.claimed) {
+      // Committed before = done for good. Otherwise another live process holds it: ask again next tick.
+      if (claim.previousCloseTime !== null && claim.previousCloseTime >= lastCandle.closeTime) {
+        this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
+      }
+      return { status: 'already-evaluated', candleCloseTime: lastCandle.closeTime };
+    }
+
+    const previous = claim.previousCloseTime;
+    const missed = previous === null ? [] : candles.filter((c) => c.closeTime > previous && c.closeTime < lastCandle.closeTime);
+    this.logger.log(
+      `${WORKER_LOG} evaluating symbol=${symbol} candleClose=${new Date(lastCandle.closeTime).toISOString()} ` +
+        `missedCandles=${missed.length}`,
+    );
+
+    this.ordersPlacedInCycle.delete(symbol);
+    try {
+      await this.evaluateCandle(symbol, strategy, mode, candles, lastCandle, missed);
+    } catch (err) {
+      if (this.ordersPlacedInCycle.has(symbol)) {
+        // An order already went out: retrying could send it twice. Mark the candle done instead.
+        this.logger.error(
+          `${WORKER_LOG} evaluation_failed_after_order symbol=${symbol} - candle not retried to avoid a duplicate order`,
+        );
+        this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
+        await this.commitCheckpoint(checkpointKey, lastCandle.closeTime);
+      } else {
+        // Nothing was sent: free the candle so the next tick retries it.
+        await this.checkpoints
+          .release(checkpointKey, lastCandle.closeTime, WORKER_INSTANCE_ID)
+          .catch((e: Error) => this.logger.warn(`Could not release the claim on ${checkpointKey}: ${e.message}`));
+      }
+      throw err;
+    }
+
+    this.lastProcessedCloseTime.set(dedupeKey, lastCandle.closeTime);
+    await this.commitCheckpoint(checkpointKey, lastCandle.closeTime);
+    return { status: 'evaluated', candleCloseTime: lastCandle.closeTime, missedCandles: missed.length };
+  }
+
+  private async commitCheckpoint(key: string, closeTime: number): Promise<void> {
+    try {
+      await this.checkpoints.commit(key, closeTime, WORKER_INSTANCE_ID);
+    } catch (err) {
+      // The claim's lease still keeps other processes off this candle for a while, and this
+      // process remembers it in memory: only a restart within the lease could re-evaluate it.
+      this.logger.error(`${WORKER_LOG} checkpoint_commit_failed key=${key} error="${(err as Error).message}"`);
+    }
+  }
+
+  private async evaluateCandle(
+    symbol: string,
+    strategy: ReturnType<StrategyRegistryService['get']>,
+    mode: TradeMode,
+    candles: Candle[],
+    lastCandle: Candle,
+    missed: Candle[],
+  ): Promise<void> {
     const regimeCandles =
       this.strategyConfig.regimeTimeframe === this.strategyConfig.timeframe
         ? undefined
@@ -79,13 +167,19 @@ export class ExecutionService {
 
     if (openTrade) {
       if (mode === 'PAPER') {
-        const intraExit = checkIntraCandleExit(
-          { stopLoss: openTrade.stopLoss, takeProfit: openTrade.takeProfit, side: openTrade.side },
-          lastCandle,
-        );
-        if (intraExit) {
-          await this.closePaperPosition(openTrade, intraExit.exitPrice, lastCandle.closeTime, intraExit.reason);
-          openTrade = null;
+        // Candles missed while the worker was down are checked too (oldest first): a stop/target
+        // they touched would have closed the position had the worker been running.
+        const entryMs = openTrade.entryTime ? new Date(openTrade.entryTime).getTime() : 0;
+        for (const c of [...missed.filter((m) => m.closeTime > entryMs), lastCandle]) {
+          const intraExit = checkIntraCandleExit(
+            { stopLoss: openTrade.stopLoss, takeProfit: openTrade.takeProfit, side: openTrade.side },
+            c,
+          );
+          if (intraExit) {
+            await this.closePaperPosition(openTrade, intraExit.exitPrice, c.closeTime, intraExit.reason);
+            openTrade = null;
+            break;
+          }
         }
       }
 
@@ -152,7 +246,7 @@ export class ExecutionService {
 
     const orderSide = entryOrderSide(side);
     const entryClientOrderId = generateClientOrderId(mode, symbol, lastCandle.closeTime, 'ENTRY');
-    const entryOrder = await this.gateway.placeOrder({
+    const entryOrder = await this.placeOrder({
       symbol,
       side: orderSide,
       type: 'MARKET',
@@ -237,7 +331,7 @@ export class ExecutionService {
         : stopLoss * (1 - this.config.stopLimitOffsetPct);
 
     try {
-      const stopOrder = await this.gateway.placeOrder({
+      const stopOrder = await this.placeOrder({
         symbol,
         side: stopSide,
         type: 'STOP_LOSS_LIMIT',
@@ -265,7 +359,7 @@ export class ExecutionService {
       this.logger.error(message);
       this.eventEmitter.emit('alert.critical', { message });
       const emergencyClientOrderId = generateClientOrderId(mode, symbol, Date.now(), 'EXIT');
-      const emergencyOrder = await this.gateway.placeOrder({
+      const emergencyOrder = await this.placeOrder({
         symbol,
         side: stopSide,
         type: 'MARKET',
@@ -304,7 +398,7 @@ export class ExecutionService {
     }
 
     const clientOrderId = generateClientOrderId(mode, symbol, closeTime, 'EXIT');
-    const order = await this.gateway.placeOrder({
+    const order = await this.placeOrder({
       symbol,
       side: exitOrderSide(trade.side),
       type: 'MARKET',
@@ -329,7 +423,7 @@ export class ExecutionService {
     closeTime: number,
     reason: TradeExitReason,
   ): Promise<void> {
-    await this.gateway.placeOrder({
+    await this.placeOrder({
       symbol: trade.symbol,
       side: exitOrderSide(trade.side),
       type: 'MARKET',
@@ -365,8 +459,20 @@ export class ExecutionService {
     });
   }
 
+  /** Every order of a cycle goes through here, so a failed cycle knows whether it already traded. */
+  private placeOrder(params: Parameters<ExchangeGateway['placeOrder']>[0]): ReturnType<ExchangeGateway['placeOrder']> {
+    this.ordersPlacedInCycle.add(params.symbol);
+    return this.gateway.placeOrder(params);
+  }
+
   private async fetchClosedCandles(symbol: string, interval: string, limit: number): Promise<Candle[]> {
-    const candles = await this.gateway.getCandles({ symbol, interval, limit: limit + 2 });
+    let candles: Candle[];
+    try {
+      candles = await this.gateway.getCandles({ symbol, interval, limit: limit + 2 });
+    } catch (err) {
+      // Tagged so the incident layer reports "Binance API" rather than a generic cycle failure.
+      throw new MarketDataError((err as Error).message, err);
+    }
     return candles.filter((c) => c.isClosed);
   }
 
@@ -375,14 +481,18 @@ export class ExecutionService {
   async heartbeat(): Promise<void> {
     if (!this.config.enabled) return;
     const mode = this.trading.mode;
-    const [openTrades, balance] = await Promise.all([
-      this.tradesService.countOpenPositions(mode),
-      this.gateway.getBalance(QUOTE_ASSET).catch(() => undefined),
-    ]);
-    const equity = balance?.free ?? 0;
-    this.logger.log(
-      `Heartbeat: mode=${mode}, openTrades=${openTrades}, equity=${equity.toFixed(2)}, lastCycle=${this.runtimeStatus.getLastCycleAgoLabel()}`,
-    );
+    try {
+      const [openTrades, balance] = await Promise.all([
+        this.tradesService.countOpenPositions(mode),
+        this.gateway.getBalance(QUOTE_ASSET).catch(() => undefined),
+      ]);
+      const equity = balance?.free ?? 0;
+      this.logger.log(
+        `${WORKER_LOG} heartbeat mode=${mode} openTrades=${openTrades} equity=${equity.toFixed(2)} lastCycle=${this.runtimeStatus.getLastCycleAgoLabel()}`,
+      );
+    } catch (err) {
+      this.logger.warn(`${WORKER_LOG} heartbeat log failed: ${(err as Error).message}`);
+    }
   }
 
   private tryEvaluate(

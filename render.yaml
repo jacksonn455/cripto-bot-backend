@@ -7,7 +7,10 @@ services:
     dockerfilePath: ./Dockerfile
     # Binance blocks US IPs (HTTP 451): the market-data feed only works from outside the US.
     region: frankfurt
-    # Free instances sleep after 15 min without traffic, which stops the paper loop.
+    # Free instances sleep after 15 min without traffic, which stops the paper loop (the worker
+    # runs in this process). The live service is "cripto-bot-backend" (not created from this
+    # blueprint): its instance type must be set to Starter+ in Render > Settings > Instance Type.
+    # Don't rename it here — a blueprint sync would create a SECOND trading service on the same DB.
     plan: starter
     healthCheckPath: /health
     autoDeploy: true
@@ -50,6 +53,24 @@ services:
         sync: false
       - key: DISCORD_EVENTS
         value: alerts,trades
+      # Operational incidents/recoveries (Binance, MongoDB, Redis, worker) on the same webhook.
+      - key: DISCORD_ALERTS_ENABLED
+        value: "true"
+      - key: DISCORD_ALERT_COOLDOWN_SECONDS
+        value: "300"
+      - key: INCIDENT_FAILURE_THRESHOLD
+        value: "3"
+      - key: KRYPTO_ENVIRONMENT
+        value: PRODUCTION
+      - key: NOTIFICATIONS_TIME_ZONE
+        value: America/Sao_Paulo
+      # Worker liveness: no heartbeat for this long = OFFLINE (also /health 503 → Render restart).
+      - key: WORKER_HEARTBEAT_TIMEOUT_SECONDS
+        value: "300"
+      - key: WORKER_DOWNTIME_ALERT_MINUTES
+        value: "10"
+      - key: BINANCE_HTTP_TIMEOUT_MS
+        value: "15000"
       - key: OPENAI_AGENTS_ENABLED
         sync: false
       - key: OPENAI_TRACING_ENABLED
@@ -68,4 +89,40 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
+        sync: false
+
+  # External heartbeat watchdog: a dead or sleeping worker can't report itself, so this separate,
+  # short-lived job reads the persisted heartbeat every 5 min and sends "WORKER OFFLINE" (once per
+  # outage) to the same Discord webhook. Never runs the strategy. Billed per run time (paid plan).
+  - type: cron
+    name: cripto-bot-watchdog
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: node dist/watchdog/heartbeat-watchdog.js
+    region: frankfurt
+    plan: starter
+    schedule: "*/5 * * * *"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRADING_MODE
+        value: PAPER
+      - key: EXECUTION_ENABLED
+        value: "true"
+      - key: WORKER_HEARTBEAT_TIMEOUT_SECONDS
+        value: "300"
+      - key: KRYPTO_ENVIRONMENT
+        value: PRODUCTION
+      - key: NOTIFICATIONS_TIME_ZONE
+        value: America/Sao_Paulo
+      - key: DISCORD_EVENTS
+        value: alerts,trades
+      - key: DISCORD_ALERTS_ENABLED
+        value: "true"
+      # Same values as the web service (secrets: set them in the dashboard).
+      - key: MONGO_URI
+        sync: false
+      - key: DISCORD_ENABLED
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
         sync: false

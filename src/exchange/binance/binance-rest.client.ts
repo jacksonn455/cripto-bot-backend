@@ -65,10 +65,13 @@ export class BinanceRestClient {
     apiSecret: string,
     baseUrl: string,
     recvWindow: number,
+    timeoutMs = 15_000,
   ) {
     this.client = new Spot(apiKey, apiSecret, {
       baseURL: baseUrl,
       recvWindow,
+      // The SDK default is 0 (wait forever): a hung connection would freeze the execution loop.
+      timeout: timeoutMs,
     });
   }
 

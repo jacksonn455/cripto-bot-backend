@@ -33,6 +33,7 @@ export class BinanceExchangeGateway implements ExchangeGateway {
       this.config.apiSecret,
       this.config.baseUrl,
       this.config.recvWindow,
+      this.config.httpTimeoutMs,
     );
     this.logger.log(`Binance gateway configured against ${this.config.baseUrl}`);
   }

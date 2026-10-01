@@ -146,3 +146,4 @@ describe('TelegramNotificationProvider', () => {
     expect(text).toContain('PnL -50.00 USDT · motivo: Stop loss · duração 2h00');
   });
 });
+

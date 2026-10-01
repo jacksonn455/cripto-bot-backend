@@ -60,6 +60,7 @@ function boot(db: ReturnType<typeof makeDb>) {
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
     { mode: 'PAPER' } as never,
     { emit: jest.fn() } as never,
     {} as never,

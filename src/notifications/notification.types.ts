@@ -3,9 +3,30 @@ import type { TradeClosedEvent, TradeOpenedEvent } from '../trades/trade-events'
 
 export type NotificationLevel = 'info' | 'warning' | 'critical';
 
+/**
+ * Operational notice from the incident layer (IncidentService / the heartbeat watchdog):
+ * incident = a problem started; recovery = it ended (or the worker came back); restart = the
+ * worker restarted after an unclean exit. Every value is already sanitized (no secrets, no stacks).
+ */
+export interface OpsNotice {
+  phase: 'incident' | 'recovery' | 'restart';
+  /** Title after "KRYPTO —", e.g. "INCIDENT", "WORKER OFFLINE", "RECOVERED", "RESTARTED". */
+  headline: string;
+  /** One operational sentence, e.g. "Binance API falhando para BTCUSDT". */
+  summary: string;
+  severity: NotificationLevel;
+  /** Ordered facts shown as embed fields: [name, value]. */
+  fields: Array<[string, string]>;
+  /** Stable incident key (footer), e.g. MARKET_DATA:BTCUSDT. */
+  incidentKey: string;
+  /** ISO time of the notice. */
+  at: string;
+}
+
 /** Everything a channel may be asked to deliver. Providers format each kind their own way. */
 export type Notification =
   | { kind: 'alert'; level: NotificationLevel; message: string }
+  | { kind: 'ops'; notice: OpsNotice }
   | { kind: 'trade.opened'; trade: TradeOpenedEvent }
   | { kind: 'trade.closed'; trade: TradeClosedEvent };
 
@@ -30,13 +51,15 @@ export interface NotificationProvider {
 
 export const NOTIFICATION_PROVIDERS = Symbol('NOTIFICATION_PROVIDERS');
 
+/** Ops notices count as `alerts` for channels filtered by category (Discord gates them with DISCORD_ALERTS_ENABLED). */
 export function categoryOf(notification: Notification): NotificationCategory {
-  return notification.kind === 'alert' ? 'alerts' : 'trades';
+  return notification.kind === 'alert' || notification.kind === 'ops' ? 'alerts' : 'trades';
 }
 
 /** Short human label for logs. */
 export function describeNotification(notification: Notification): string {
   if (notification.kind === 'alert') return `alert:${notification.level}`;
+  if (notification.kind === 'ops') return `ops:${notification.notice.phase} ${notification.notice.incidentKey}`;
   const t = notification.trade;
   return `${notification.kind} ${t.side} ${t.symbol}`;
 }

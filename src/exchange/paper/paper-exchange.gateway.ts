@@ -44,6 +44,7 @@ export class PaperExchangeGateway implements ExchangeGateway {
       '',
       binance.marketDataBaseUrl,
       binance.recvWindow,
+      binance.httpTimeoutMs,
     );
     this.balances.set(trading.paperInitialBalanceAsset, {
       asset: trading.paperInitialBalanceAsset,

@@ -11,6 +11,7 @@ import { TRADE_CLOSED } from '../trades/trade-events';
 import { TradesService } from '../trades/trades.service';
 import { RuntimeStatusService, SignalSnapshot } from './runtime-status.service';
 import { BotState, BotStateDocument } from './schemas/bot-state.schema';
+import { WorkerHeartbeatService, WorkerStatus } from './worker-heartbeat.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
 
@@ -43,6 +44,11 @@ export interface BotStatus {
   openTrades: number;
   equity: number;
   lastError: string | null;
+  /**
+   * Execution worker liveness from its persisted heartbeat (ONLINE/OFFLINE/STARTING/DISABLED).
+   * Independent of trades and of lastCycleAt: "no entry" never means "worker offline".
+   */
+  worker: WorkerStatus;
 }
 
 @Injectable()
@@ -54,6 +60,7 @@ export class ControlService {
     @Inject(EXCHANGE_GATEWAY) private readonly gateway: ExchangeGateway,
     private readonly tradesService: TradesService,
     private readonly runtimeStatus: RuntimeStatusService,
+    private readonly workerHeartbeat: WorkerHeartbeatService,
     @Inject(tradingConfig.KEY) private readonly trading: ReturnType<typeof tradingConfig>,
     private readonly eventEmitter: EventEmitter2,
     @Inject(executionConfig.KEY) private readonly execution: ReturnType<typeof executionConfig>,
@@ -66,10 +73,11 @@ export class ControlService {
   /** Everything GET /bot/status needs: persisted bot_state + live execution/runtime info. */
   async getStatus(): Promise<BotStatus> {
     const mode = this.trading.mode;
-    const [state, openTrades, balance] = await Promise.all([
+    const [state, openTrades, balance, worker] = await Promise.all([
       this.getOrCreateState(),
       this.tradesService.countOpenPositions(mode),
       this.gateway.getBalance(QUOTE_ASSET).catch(() => null),
+      this.workerHeartbeat.getStatus(),
     ]);
 
     return {
@@ -87,6 +95,7 @@ export class ControlService {
       openTrades,
       equity: balance?.free ?? 0,
       lastError: this.runtimeStatus.getLastError(),
+      worker,
     };
   }
 

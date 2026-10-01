@@ -56,6 +56,7 @@ function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } 
     gateway as never,
     tradesService as never,
     runtimeStatus as never,
+    { getStatus: jest.fn().mockResolvedValue({ state: 'ONLINE' }) } as never,
     { mode: 'PAPER' } as never,
     eventEmitter as never,
     { enabled: true, pollIntervalSeconds: 60 } as never,

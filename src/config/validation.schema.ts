@@ -53,6 +53,7 @@ export const validationSchema = Joi.object({
   // Read-only price feed for PAPER mode/backtests, decoupled from where orders are routed —
   // defaults to real production data so simulated fills reflect real market prices.
   MARKET_DATA_BASE_URL: Joi.string().uri().default('https://api.binance.com'),
+  BINANCE_HTTP_TIMEOUT_MS: Joi.number().integer().min(1000).max(120000).default(15000),
 
   PAPER_INITIAL_BALANCE_ASSET: Joi.string().default('USDT'),
   PAPER_INITIAL_BALANCE_AMOUNT: Joi.number().positive().default(10000),
@@ -94,6 +95,9 @@ export const validationSchema = Joi.object({
   EXECUTION_RECONCILIATION_INTERVAL_MINUTES: Joi.number().integer().positive().default(15),
   EXECUTION_STOP_LIMIT_OFFSET_PCT: Joi.number().min(0).max(0.1).default(0.001),
   EQUITY_SNAPSHOT_INTERVAL_MINUTES: Joi.number().integer().positive().default(5),
+  WORKER_HEARTBEAT_TIMEOUT_SECONDS: Joi.number().integer().min(60).default(300),
+  WORKER_DOWNTIME_ALERT_MINUTES: Joi.number().integer().positive().default(10),
+  EXECUTION_SYMBOL_TIMEOUT_SECONDS: Joi.number().integer().min(10).default(120),
 
   // --- ControlModule ---
   // true = reads need the key too (except /health). Use when the API is reachable from the internet.
@@ -132,6 +136,11 @@ export const validationSchema = Joi.object({
     'string.pattern.base': 'DISCORD_EVENTS must be a comma-separated list of: alerts, trades',
   }),
   NOTIFICATIONS_TIMEOUT_MS: Joi.number().integer().min(500).max(30000).default(5000),
+  NOTIFICATIONS_TIME_ZONE: Joi.string().default('America/Sao_Paulo'),
+  DISCORD_ALERTS_ENABLED: Joi.boolean().default(true),
+  DISCORD_ALERT_COOLDOWN_SECONDS: Joi.number().integer().min(0).default(300),
+  INCIDENT_FAILURE_THRESHOLD: Joi.number().integer().min(1).max(100).default(3),
+  KRYPTO_ENVIRONMENT: Joi.string().max(40).optional(),
 
   // --- Funding scanner (read-only) ---
   FUNDING_SCAN_ENABLED: Joi.boolean().default(true),

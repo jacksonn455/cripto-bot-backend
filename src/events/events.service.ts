@@ -101,6 +101,22 @@ export class EventsService {
     this.push('bot.cycle', { ...data, reevaluation }, { withMode: true });
   }
 
+  /** Worker lifecycle (WorkerHeartbeatService): start (with the downtime it found, if any), loop stall/resume. */
+  @OnEvent('worker.started')
+  onWorkerStarted(payload: unknown): void {
+    this.push('worker.started', payload, { withMode: true });
+  }
+
+  @OnEvent('worker.stalled')
+  onWorkerStalled(payload: unknown): void {
+    this.push('worker.stalled', payload, { withMode: true });
+  }
+
+  @OnEvent('worker.resumed')
+  onWorkerResumed(payload: unknown): void {
+    this.push('worker.resumed', payload, { withMode: true });
+  }
+
   /** Execution loop error (deduplicated at the source, see RuntimeStatusService). */
   @OnEvent('bot.error')
   onError(payload: unknown): void {

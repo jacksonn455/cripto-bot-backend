@@ -8,15 +8,25 @@ import { ControlController } from './control.controller';
 import { ControlService } from './control.service';
 import { RuntimeStatusService } from './runtime-status.service';
 import { BotState, BotStateSchema } from './schemas/bot-state.schema';
+import { WorkerHeartbeat, WorkerHeartbeatSchema } from './schemas/worker-heartbeat.schema';
+import { WorkerHeartbeatService } from './worker-heartbeat.service';
 
 @Module({
   imports: [
-    MongooseModule.forFeature([{ name: BotState.name, schema: BotStateSchema }]),
+    MongooseModule.forFeature([
+      { name: BotState.name, schema: BotStateSchema },
+      { name: WorkerHeartbeat.name, schema: WorkerHeartbeatSchema },
+    ]),
     ExchangeModule,
     TradesModule,
   ],
   controllers: [ControlController],
-  providers: [ControlService, RuntimeStatusService, { provide: APP_GUARD, useClass: GlobalApiKeyGuard }],
-  exports: [ControlService, RuntimeStatusService],
+  providers: [
+    ControlService,
+    RuntimeStatusService,
+    WorkerHeartbeatService,
+    { provide: APP_GUARD, useClass: GlobalApiKeyGuard },
+  ],
+  exports: [ControlService, RuntimeStatusService, WorkerHeartbeatService],
 })
 export class ControlModule {}

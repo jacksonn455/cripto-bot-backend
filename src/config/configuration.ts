@@ -29,6 +29,8 @@ export const binanceConfig = registerAs('binance', () => ({
   recvWindow: parseInt(process.env.BINANCE_RECV_WINDOW ?? '5000', 10),
   // Where PAPER/backtest read prices from — independent of baseUrl (where real orders go).
   marketDataBaseUrl: process.env.MARKET_DATA_BASE_URL ?? 'https://api.binance.com',
+  // Per HTTP request. The SDK's default is 0 = no timeout: one hung request froze a symbol's cycle forever.
+  httpTimeoutMs: parseInt(process.env.BINANCE_HTTP_TIMEOUT_MS ?? '15000', 10),
 }));
 
 export const trendRegimeConfig = registerAs('trendRegime', () => ({
@@ -87,6 +89,13 @@ export const executionConfig = registerAs('execution', () => ({
   stopLimitOffsetPct: parseFloat(process.env.EXECUTION_STOP_LIMIT_OFFSET_PCT ?? '0.001'),
   // How often PAPER/LIVE equity (cash + open positions at last price) is written to equity_snapshots.
   equitySnapshotIntervalMinutes: parseInt(process.env.EQUITY_SNAPSHOT_INTERVAL_MINUTES ?? '5', 10),
+  // No persisted worker heartbeat for this long = worker OFFLINE (also the loop-stall threshold).
+  workerHeartbeatTimeoutSeconds: parseInt(process.env.WORKER_HEARTBEAT_TIMEOUT_SECONDS ?? '300', 10),
+  // A start after a heartbeat gap longer than this is reported as a recovery (event + alert);
+  // shorter gaps are ordinary deploys/restarts.
+  workerDowntimeAlertMinutes: parseInt(process.env.WORKER_DOWNTIME_ALERT_MINUTES ?? '10', 10),
+  // Upper bound for one symbol's cycle, so a stuck symbol can't hold back the others.
+  symbolCycleTimeoutSeconds: parseInt(process.env.EXECUTION_SYMBOL_TIMEOUT_SECONDS ?? '120', 10),
 }));
 
 export const controlConfig = registerAs('control', () => ({
@@ -118,6 +127,18 @@ export const notificationsConfig = registerAs('notifications', () => ({
   discordEvents: parseCategories(process.env.DISCORD_EVENTS, 'alerts,trades'),
   // Per HTTP attempt; a slow chat API can never hold a trade cycle (delivery is fire-and-forget anyway).
   timeoutMs: parseInt(process.env.NOTIFICATIONS_TIMEOUT_MS ?? '5000', 10),
+  // Clock times inside alert messages (worker offline/recovered) are written in this zone.
+  timeZone: process.env.NOTIFICATIONS_TIME_ZONE ?? 'America/Sao_Paulo',
+  // Operational incidents/recoveries on the same Discord webhook. Off = trades keep flowing,
+  // incident notices are only logged. DISCORD_ENABLED=false still silences Discord entirely.
+  discordAlertsEnabled: process.env.DISCORD_ALERTS_ENABLED !== 'false',
+  // Anti-flap: a component that recovers and fails again within this window opens a new incident
+  // (tracked and logged) without a second Discord message.
+  alertCooldownSeconds: parseInt(process.env.DISCORD_ALERT_COOLDOWN_SECONDS ?? '300', 10),
+  // Consecutive failed checks (≈ poll ticks) before a recoverable error becomes an incident.
+  incidentFailureThreshold: parseInt(process.env.INCIDENT_FAILURE_THRESHOLD ?? '3', 10),
+  // Shown as "Ambiente" in incident notices (defaults to NODE_ENV).
+  environment: (process.env.KRYPTO_ENVIRONMENT ?? process.env.NODE_ENV ?? 'development').toUpperCase(),
 }));
 
 export const fundingConfig = registerAs('funding', () => ({
