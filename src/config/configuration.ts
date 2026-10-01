@@ -49,6 +49,18 @@ export const trendRegimeConfig = registerAs('trendRegime', () => ({
   // 1 = the strategy also emits ENTER_SHORT (mirror of the long rules). A number, not a boolean,
   // so backtests can override it through strategyParams like any other knob. Off by default.
   allowShort: process.env.TREND_ALLOW_SHORT === 'true' ? 1 : 0,
+  // ADX(adxPeriod) on the regime timeframe must be >= adxMin to enter. 0 = filter off (default).
+  adxPeriod: parseInt(process.env.TREND_ADX_PERIOD ?? '14', 10),
+  adxMin: parseFloat(process.env.TREND_ADX_MIN ?? '0'),
+  // Regime only counts as up/down beyond EMA × (1 ± band), so it doesn't flip on every touch of the
+  // EMA. Fraction (0.01 = 1%); 0 = plain close vs EMA (default).
+  regimeBandPct: parseFloat(process.env.TREND_REGIME_BAND_PCT ?? '0'),
+  // Research variants (docs/ESTRATEGIA-PESQUISA.md section 5), backtest only: deliberately NOT read
+  // from env, so paper/live keep the validated behavior until a variant passes the protocol.
+  // 1 = trailing stop since entry, checked inside the candle (V1); 0 = rolling chandelier on close.
+  trailingMode: 0,
+  // N > 0 = also enter on a pullback to EMA fast within the last N candles (V3); 0 = off.
+  pullbackLookback: 0,
 }));
 
 export const riskConfig = registerAs('risk', () => ({

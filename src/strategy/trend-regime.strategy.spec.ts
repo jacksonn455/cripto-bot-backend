@@ -247,3 +247,108 @@ describe('TrendRegimeStrategy short side (allowShort=1)', () => {
 function candlesRange(length: number, value: number): number[] {
   return Array.from({ length }, () => value);
 }
+
+describe('TrendRegimeStrategy research filters (off by default)', () => {
+  // Same golden-cross fixture as above: close 90 vs EMA(4) = 85.5 on the last candle.
+  const candles = makeCandles([100, 95, 90, 85, 80, 75, 90]);
+  const withKnobs = (knobs: { adxMin?: number; adxPeriod?: number; regimeBandPct?: number }) =>
+    new TrendRegimeStrategy(new IndicatorsService(), { ...TINY_CONFIG, ...knobs });
+
+  it('adds no ADX to the snapshot while the filter is off', () => {
+    const signal = withKnobs({}).onCandleClosed({ symbol: 'BTCUSDT', candles });
+    expect(signal.action).toBe('ENTER_LONG');
+    expect(signal.indicators).not.toHaveProperty('adx');
+  });
+
+  it('blocks the entry when ADX is below adxMin, and says so', () => {
+    const signal = withKnobs({ adxMin: 100, adxPeriod: 2 }).onCandleClosed({ symbol: 'BTCUSDT', candles });
+    expect(signal.action).toBe('NONE');
+    expect(signal.reason).toContain('ADX abaixo de 100');
+    expect(signal.indicators.adx).toBeDefined();
+  });
+
+  it('lets the entry through when ADX clears a low adxMin', () => {
+    const signal = withKnobs({ adxMin: 1, adxPeriod: 2 }).onCandleClosed({ symbol: 'BTCUSDT', candles });
+    expect(signal.action).toBe('ENTER_LONG');
+    expect(signal.indicators.adx).toBeGreaterThanOrEqual(1);
+  });
+
+  it('with a regime band, needs the close beyond EMA × (1 + band)', () => {
+    // 85.5 × 1.10 = 94.05 > 90: not an up regime yet. 85.5 × 1.05 = 89.8 < 90: up.
+    const wide = withKnobs({ regimeBandPct: 0.1 }).onCandleClosed({ symbol: 'BTCUSDT', candles });
+    expect(wide.action).toBe('NONE');
+    expect(wide.reason).toContain('regime nao esta em alta');
+    expect(withKnobs({ regimeBandPct: 0.05 }).onCandleClosed({ symbol: 'BTCUSDT', candles }).action).toBe('ENTER_LONG');
+  });
+});
+
+describe('TrendRegimeStrategy research variants (backtest only, off by default)', () => {
+  const withKnobs = (knobs: { trailingMode?: number; pullbackLookback?: number; allowShort?: number; emaSlow?: number; chandelierAtrMultiplier?: number }) =>
+    new TrendRegimeStrategy(new IndicatorsService(), { ...TINY_CONFIG, ...knobs });
+
+  describe('V3 pullback entry (pre-registered rule)', () => {
+    // Steady +1 climb (lows touch EMA2 every candle), then a close above the previous high.
+    const up = makeCandles([...Array.from({ length: 16 }, (_, i) => 100 + i), 118]);
+
+    it('enters long on the resumption after a touch of EMA fast in an established uptrend', () => {
+      const signal = withKnobs({ pullbackLookback: 3 }).onCandleClosed({ symbol: 'BTCUSDT', candles: up });
+      expect(signal.action).toBe('ENTER_LONG');
+      expect(signal.indicators.pullback).toBe(1);
+      expect(signal.reason).toContain('Pullback');
+      expect(signal.stopLoss).toBeLessThan(118);
+    });
+
+    it('does nothing with the rule off (default): no fresh cross, no entry', () => {
+      expect(withKnobs({}).onCandleClosed({ symbol: 'BTCUSDT', candles: up }).action).toBe('NONE');
+    });
+
+    it('needs the touch: a trend that never came back to EMA fast is not a pullback', () => {
+      const noTouch = makeCandles([...Array.from({ length: 16 }, (_, i) => 100 + i), 118], candlesRange(17, 0));
+      expect(withKnobs({ pullbackLookback: 3 }).onCandleClosed({ symbol: 'BTCUSDT', candles: noTouch }).action).toBe('NONE');
+    });
+
+    it('needs the confirmation: no close above the previous high, no entry', () => {
+      const flatEnd = makeCandles([...Array.from({ length: 16 }, (_, i) => 100 + i), 115.5]);
+      expect(withKnobs({ pullbackLookback: 3 }).onCandleClosed({ symbol: 'BTCUSDT', candles: flatEnd }).action).toBe('NONE');
+    });
+
+    it('mirrors for shorts (only with shorts on)', () => {
+      const down = makeCandles([...Array.from({ length: 16 }, (_, i) => 200 - i), 182]);
+      const signal = withKnobs({ pullbackLookback: 3, allowShort: 1 }).onCandleClosed({ symbol: 'BTCUSDT', candles: down });
+      expect(signal.action).toBe('ENTER_SHORT');
+      expect(signal.indicators.pullback).toBe(1);
+      expect(signal.stopLoss).toBeGreaterThan(182);
+      expect(withKnobs({ pullbackLookback: 3 }).onCandleClosed({ symbol: 'BTCUSDT', candles: down }).action).toBe('NONE');
+    });
+  });
+
+  describe('V1 trailing since entry', () => {
+    const candles = makeCandles([100, 101, 102, 103, 104, 105, 106], candlesRange(7, 0.2));
+    const position = { side: 'LONG' as const, entryPrice: 102, stopLoss: 95, entryTime: candles[2].closeTime };
+
+    it('proposes highest high since entry − m × ATR as the new stop', () => {
+      const signal = withKnobs({ trailingMode: 1 }).onCandleClosed({ symbol: 'BTCUSDT', candles, openPosition: position });
+      expect(signal.action).toBe('NONE');
+      // Highest high after the entry candle = 106.2 (last candle); ATR(3) of a tight +1 climb ≈ 1.
+      expect(signal.trailingStop).toBeLessThan(106.2);
+      expect(signal.trailingStop).toBeGreaterThan(102);
+    });
+
+    it('sends no trailing level in the default mode, or before a candle has closed after the entry', () => {
+      expect(withKnobs({}).onCandleClosed({ symbol: 'BTCUSDT', candles, openPosition: position }).trailingStop).toBeUndefined();
+      const justEntered = { ...position, entryTime: candles[6].closeTime };
+      expect(withKnobs({ trailingMode: 1 }).onCandleClosed({ symbol: 'BTCUSDT', candles, openPosition: justEntered }).trailingStop).toBeUndefined();
+    });
+
+    it('replaces the close-based chandelier exit (that scenario now just tightens the stop)', () => {
+      const closes = [...Array.from({ length: 30 }, (_, i) => 200 - i), 176];
+      const bounce = makeCandles(closes, candlesRange(closes.length, 0.2));
+      const short = { side: 'SHORT' as const, entryPrice: 190, stopLoss: 200, entryTime: bounce[10].closeTime };
+      const knobs = { allowShort: 1, emaSlow: 20, chandelierAtrMultiplier: 1 };
+      expect(withKnobs(knobs).onCandleClosed({ symbol: 'BTCUSDT', candles: bounce, openPosition: short }).action).toBe('EXIT');
+      const trailing = withKnobs({ ...knobs, trailingMode: 1 }).onCandleClosed({ symbol: 'BTCUSDT', candles: bounce, openPosition: short });
+      expect(trailing.action).toBe('NONE');
+      expect(trailing.trailingStop).toBeLessThan(200);
+    });
+  });
+});

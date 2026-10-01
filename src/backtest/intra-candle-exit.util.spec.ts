@@ -47,4 +47,33 @@ describe('checkIntraCandleExit', () => {
       expect(checkIntraCandleExit({ side: 'SHORT', stopLoss: 105 }, { high: 100, low: 80 })).toBeNull();
     });
   });
+
+  describe('gaps through the stop', () => {
+    it('fills a long at the open when the candle opens below the stop', () => {
+      expect(checkIntraCandleExit({ stopLoss: 95 }, { open: 90, high: 92, low: 88 })).toEqual({
+        exitPrice: 90,
+        reason: 'SL',
+        gapped: true,
+      });
+    });
+
+    it('fills a short at the open when the candle opens above the stop (squeeze)', () => {
+      expect(checkIntraCandleExit({ side: 'SHORT', stopLoss: 105 }, { open: 112, high: 115, low: 110 })).toEqual({
+        exitPrice: 112,
+        reason: 'SL',
+        gapped: true,
+      });
+    });
+
+    it('keeps the stop price when the candle opens on the safe side and trades through it', () => {
+      expect(checkIntraCandleExit({ stopLoss: 95 }, { open: 99, high: 100, low: 90 })).toEqual({ exitPrice: 95, reason: 'SL' });
+    });
+
+    it('never fills a target better than its price, even on a favorable gap', () => {
+      expect(checkIntraCandleExit({ stopLoss: 95, takeProfit: 110 }, { open: 115, high: 116, low: 114 })).toEqual({
+        exitPrice: 110,
+        reason: 'TP',
+      });
+    });
+  });
 });

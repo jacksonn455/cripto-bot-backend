@@ -17,6 +17,14 @@ walk-forward fora da amostra** — cada variante testada entra no contador `para
 - Correção de risco: stop/take profit do lado errado da entrada agora são vetados
   (`INVALID_STOP_DISTANCE` / `INVALID_TAKE_PROFIT`), antes passavam por causa de `Math.abs`.
 
+### ✅ Rodada V0–V3 (2026-09-30): nenhuma variante aprovada
+Protocolo na §5 e resultado em [research/VARIANTES-V0-V3.md](research/VARIANTES-V0-V3.md).
+- O long não tem edge depois dos custos: fora da amostra, PF 0,91 com custos 1× e 0,67 com 2×; DSR 0,04.
+- O short não agrega em nenhuma variante.
+- O V1 (regime com histórico completo + trailing desde a entrada) piorou o resultado. O V3 (pullback) triplicou os trades com sinal pior.
+- O paper continua no V0, e o short deve ficar desligado.
+- O próximo passo mais promissor é o horizonte (sinal em 4h ou diário), com protocolo novo e o N acumulado.
+
 ### 🧪 Recomendado para testar (backtest walk-forward → paper), em ordem
 1. **E3 – Robustez a custos** (fees/slippage 1×, 2×, 3×) — valida a base de custos antes de tudo.
 2. **E1 – O Short agrega valor?** Long-only (baseline) vs Long+Short, com `shortBorrowPctPerDay`.
@@ -271,6 +279,76 @@ Ordem sugerida: E3 → E1 → E2 → E4 → E5 (E3 valida a base de custo usada 
 - Grid search amplo (muitas combinações) — aumenta N, derruba o DSR e o PBO fica alto.
 - Ligar o Short em produção com alavancagem antes de paper trading com funding/juros reais.
 - Julgar variantes por win rate ou por lucro in-sample.
+
+## 5. Protocolo pré-registrado: variantes V0–V3 (registrado em 2026-09-30, antes de qualquer resultado)
+
+Origem: o backtest de BTCUSDT de 01/04 a 30/09/2026 fez só 3 trades porque a trava de stops seguidos nunca
+expirava (bug corrigido: no backtest a pausa dura até o próximo dia UTC; no paper/live a sequência só conta
+trades fechadas depois da última retomada manual). Sem a trava, o mesmo período tem 34 sinais.
+Ver o diagnóstico na conversa e o motor v2.
+
+### Variantes (cada uma muda UMA coisa em relação à anterior)
+
+| Variante | Hipótese | Mudança | Como rodar (`strategyParams` / opções do backtest) |
+|---|---|---|---|
+| V0 | Base | Estratégia atual, motor v2 (stop com gap, pausa até o dia seguinte) | nada |
+| V1 | O regime e o trailing atuais têm defeitos de implementação | EMA200 do regime com 1000 candles de 4h (era 210: virava quase uma média simples) + trailing desde a entrada como stop dentro do candle | `regimeLookback: 1000`, `trailingMode: 1` |
+| V2 | O RSI não agrega (ablação, E2) | V1 sem a banda de RSI | V1 + `rsiMin: 0, rsiMax: 100` |
+| V3 | Reentrar na tendência aumenta as oportunidades sem piorar o trade médio | V1 + entrada por pullback | V1 + `pullbackLookback: 5` |
+
+**Trailing desde a entrada (V1, `trailingMode: 1`)**: depois de cada candle fechado, o stop de proteção do long passa a
+`max(stop atual, máxima desde a entrada − chandelierAtrMultiplier × ATR)`, onde "desde a entrada" são os candles
+fechados depois do candle de entrada. O stop nunca afrouxa. Ele é verificado dentro dos candles seguintes, como o stop
+inicial (com a regra de gap). Isso substitui a saída por chandelier no fechamento com janela rolante. A saída pelo
+cruzamento das EMAs continua. O short é o espelho: mínima desde a entrada + m × ATR, com `min`. Saída por um stop que já
+se moveu = `TRAILING`.
+
+**Entrada por pullback (V3, `pullbackLookback: N = 5`, fixado a priori, não otimizado)**: avaliada só no fechamento do candle
+`t`, sem posição aberta, quando não houve cruzamento EMA20/50 em `t`. **Long**, todas ao mesmo tempo:
+1. regime de alta (mesma regra das entradas por cruzamento);
+2. EMA20 > EMA50 em todos os candles `t−5 … t` (tendência já estabelecida);
+3. em pelo menos um candle de `t−5 … t−1`, a mínima tocou a EMA20 daquele candle (`low ≤ EMA20`);
+4. retomada: `close[t] > EMA20[t]` e `close[t] > high[t−1]`;
+5. RSI dentro da banda das entradas long.
+
+Stop, tamanho de posição e saídas iguais aos das entradas por cruzamento. **Short**, o espelho: regime de baixa; EMA20 < EMA50
+em `t−5 … t`; alguma máxima de `t−5 … t−1` ≥ a EMA20 do candle; `close[t] < EMA20[t]` e `close[t] < low[t−1]`; RSI na banda
+espelhada. É determinística e só usa candles fechados, então reproduz igual no backtest, no paper e no live.
+
+### Desenho da validação
+
+- Ativos (fixos): BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT. Timeframe 1h, regime 4h.
+- Desenvolvimento: 2023-01-01 → 2024-12-31. Fora da amostra (OOS): 2025-01-01 → 2026-09-30. Walk-forward de 90 dias
+  em cada período, com saldo encadeado. Janelas residuais com menos de 30 dias são simuladas, mas não entram na contagem
+  de janelas vencidas.
+- Execução principal: carteira única com os 5 ativos e 10.000 USDT. Também cada ativo sozinho com 10.000 (resultado por ativo).
+- Custos 1×: taxa 0,10% por lado, slippage 0,05%, slippage do stop 0,10%, custo do short 0,03% ao dia. Custos 2×: tudo dobrado.
+- Lados: cada variante roda só long e long + short. O resultado do short sozinho é lido do `bySide` da execução long + short.
+- Tentativas para o DSR: as 8 configurações (4 variantes × 2 lados), mais as 16 de sensibilidade abaixo, N = 24.
+  PBO sobre as 4 variantes (para cada lado), usando as janelas de desenvolvimento + OOS.
+- Sensibilidade (não serve para escolher nada): cada variante, só long, OOS, custos 1×, com `atrStopMultiplier`
+  1,5 e 2,5 e `chandelierAtrMultiplier` 2,5 e 3,5, um de cada vez.
+
+### Critérios (não mudam depois de ver os resultados)
+
+**A. Edge absoluto de uma configuração (OOS, carteira):**
+1. ≥ 30 trades OOS em cada lado operado;
+2. profit factor ≥ 1,1 com custos 1× e > 1,0 com custos 2×;
+3. DSR ≥ 0,95 (N = 24);
+4. retorno positivo em ≥ 60% das janelas OOS (de 30 dias ou mais);
+5. PF > 1 com custos 1× em pelo menos 3 dos 5 ativos rodados sozinhos.
+
+**B. Variante melhor que V0 (mesmo lado, OOS, custos 1×):**
+1. PF **e** expectância (retorno médio por trade) melhores em ≥ 60% das janelas OOS;
+2. R médio por trade (qualidade do sinal) não pior que o de V0: mais trades não compensa um sinal pior;
+3. Max drawdown (curva diária) ≤ 1,2× o de V0;
+4. PF com custos 2× ≥ o de V0;
+5. PBO das 4 variantes < 0,5.
+
+**C. O short agrega (para a mesma variante, OOS):** long + short com Calmar ≥ só long e max DD ≤ 1,2× só long; o lado
+short com PF > 1,1 a 1× e > 1,0 a 2×; o long + short melhor em ≥ 60% das janelas.
+
+Nenhuma variante vai para o paper sem passar em A e B. O short só volta a ser considerado se passar em C.
 
 ## 4. Fontes
 

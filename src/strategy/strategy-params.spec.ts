@@ -1,5 +1,5 @@
 import { IndicatorsService } from '../indicators/indicators.service';
-import { StrategyParamsError } from './strategy.interface';
+import { effectiveStrategyParams, StrategyParamsError } from './strategy.interface';
 import { TrendRegimeStrategy } from './trend-regime.strategy';
 
 const CONFIG = {
@@ -34,6 +34,11 @@ describe('TrendRegimeStrategy params', () => {
       chandelierLookback: 22,
       chandelierAtrMultiplier: 3,
       allowShort: 0,
+      adxMin: 0,
+      adxPeriod: 14,
+      regimeBandPct: 0,
+      trailingMode: 0,
+      pullbackLookback: 0,
     });
     expect(strategy.paramSpec.map((p) => p.key)).toEqual(Object.keys(strategy.getParams()));
   });
@@ -53,8 +58,27 @@ describe('TrendRegimeStrategy params', () => {
     [{ rsiMin: 80 }, 'rsiMin must be lower than rsiMax'],
     [{ allowShort: 2 }, 'allowShort must be between 0 and 1'],
     [{ allowShort: 0.5 }, 'allowShort must be an integer'],
+    [{ regimeBandPct: 0.5 }, 'regimeBandPct must be between 0 and 0.2'],
   ])('rejects %j', (overrides, message) => {
     expect(() => strategy.withParams(overrides)).toThrow(StrategyParamsError);
     expect(() => strategy.withParams(overrides)).toThrow(message);
+  });
+
+  describe('effectiveStrategyParams (what the backtest params hash sees)', () => {
+    it('drops the knobs that are off, so old long-only runs keep hashing the same', () => {
+      const effective = effectiveStrategyParams(strategy.paramSpec, strategy.getParams());
+      expect(effective).not.toHaveProperty('allowShort');
+      expect(effective).not.toHaveProperty('adxMin');
+      // adxPeriod only matters with the ADX filter on.
+      expect(effective).not.toHaveProperty('adxPeriod');
+      expect(effective).not.toHaveProperty('regimeBandPct');
+      expect(effective).toMatchObject({ emaFast: 20, rsiMax: 70 });
+    });
+
+    it('keeps a knob (and what depends on it) once it is turned on', () => {
+      const tuned = strategy.withParams({ adxMin: 20, allowShort: 1 });
+      const effective = effectiveStrategyParams(tuned.paramSpec, tuned.getParams());
+      expect(effective).toMatchObject({ adxMin: 20, adxPeriod: 14, allowShort: 1 });
+    });
   });
 });

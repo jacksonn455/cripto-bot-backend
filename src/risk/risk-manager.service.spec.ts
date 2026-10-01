@@ -252,3 +252,32 @@ describe('RiskManagerService', () => {
     });
   });
 });
+
+describe('RiskManagerService same-side aggregate risk cap (maxSameSideRiskPct)', () => {
+  const risk = new RiskManagerService({ ...DEFAULT_CONFIG, minRiskRewardRatio: 0 });
+  const signal = makeSignal({ takeProfit: undefined }); // risk 100 → qty 20 at a 5 stop distance
+
+  it('does nothing without the cap (production default)', () => {
+    expect(risk.evaluate(signal, makeContext({ openRiskBySide: { LONG: 1000, SHORT: 0 } }))).toEqual({ approved: true, qty: 20 });
+  });
+
+  it('shrinks the entry to what is left of the budget', () => {
+    // Budget 1.5% of 10000 = 150; 100 already at risk on longs → 50 left → qty 10.
+    const decision = risk.evaluate(signal, makeContext({ maxSameSideRiskPct: 0.015, openRiskBySide: { LONG: 100, SHORT: 0 } }));
+    expect(decision.approved).toBe(true);
+    expect(decision.qty).toBeCloseTo(10);
+  });
+
+  it('vetoes with AGGREGATE_RISK_LIMIT once the side is full', () => {
+    expect(risk.evaluate(signal, makeContext({ maxSameSideRiskPct: 0.015, openRiskBySide: { LONG: 150, SHORT: 0 } }))).toEqual({
+      approved: false,
+      rejectReason: 'AGGREGATE_RISK_LIMIT',
+    });
+  });
+
+  it('only counts the same side: open shorts do not limit a long', () => {
+    expect(
+      risk.evaluate(signal, makeContext({ maxSameSideRiskPct: 0.015, openRiskBySide: { LONG: 0, SHORT: 150 } })),
+    ).toEqual({ approved: true, qty: 20 });
+  });
+});

@@ -4,6 +4,7 @@ import { Model } from 'mongoose';
 import { ControlService } from '../control/control.service';
 import { Trade, TradeDocument, TradeMode } from '../trades/schemas/trade.schema';
 import { RiskContext } from './risk.interface';
+import { countStopStreak } from './stop-streak.util';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import type { SymbolFilters } from '../exchange/types/symbol-filters.type';
 
@@ -22,16 +23,19 @@ export class RiskContextBuilderService {
     quoteAsset: string,
     reconciliationOk: boolean,
   ): Promise<RiskContext> {
-    const [balance, openTrades, todaysClosedTrades, recentClosedTrades, symbolFilters, isPaused] =
+    // bot_state first: the stop streak only counts trades closed after the last manual resume.
+    const state = await this.controlService.getState();
+    const streakFilter = state.stopStreakResetAt ? { exitTime: { $gt: state.stopStreakResetAt } } : {};
+    const [balance, openTrades, todaysClosedTrades, recentClosedTrades, symbolFilters] =
       await Promise.all([
         gateway.getBalance(quoteAsset),
         this.tradeModel.find({ mode, status: 'OPEN' }).lean(),
         this.tradeModel
           .find({ mode, status: 'CLOSED', exitTime: { $gte: this.startOfUtcDay() } })
           .lean(),
-        this.tradeModel.find({ mode, status: 'CLOSED' }).sort({ exitTime: -1 }).limit(20).lean(),
+        // Newest first; a streak long enough to matter is far shorter than 20.
+        this.tradeModel.find({ mode, status: 'CLOSED', ...streakFilter }).sort({ exitTime: -1 }).limit(20).lean(),
         this.tryGetSymbolFilters(gateway, symbol),
-        this.controlService.isPaused(),
       ]);
 
     const currentExposureByAsset: Record<string, number> = {};
@@ -50,8 +54,8 @@ export class RiskContextBuilderService {
       currentExposureByAsset,
       totalExposure,
       dailyPnl: todaysClosedTrades.reduce((sum, t) => sum + (t.pnl ?? 0), 0),
-      consecutiveStopLosses: this.countConsecutiveStopLosses(recentClosedTrades),
-      isPaused,
+      consecutiveStopLosses: countStopStreak([...recentClosedTrades].reverse()),
+      isPaused: state.isPaused,
       reconciliationOk,
       symbolFilters,
       shortSellingSupported: gateway.supportsShortSelling === true,
@@ -66,15 +70,6 @@ export class RiskContextBuilderService {
    */
   private buyingPower(freeQuote: number, openShortNotional: number): number {
     return Math.max(0, freeQuote - 2 * openShortNotional);
-  }
-
-  private countConsecutiveStopLosses(recentClosedTradesDesc: { exitReason?: string }[]): number {
-    let count = 0;
-    for (const trade of recentClosedTradesDesc) {
-      if (trade.exitReason === 'SL') count += 1;
-      else break;
-    }
-    return count;
   }
 
   private startOfUtcDay(): Date {

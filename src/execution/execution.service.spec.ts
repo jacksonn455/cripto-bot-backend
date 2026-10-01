@@ -152,7 +152,8 @@ describe('ExecutionService (PAPER mode)', () => {
   });
 
   it('closes an open PAPER position via the conservative intra-candle stop rule', async () => {
-    const candles = [candle(2_000, 80, 85, 70)]; // low(70) breaches stopLoss(90)
+    // Opens above the stop (95) and trades down through it: low(70) breaches stopLoss(90).
+    const candles = [{ ...candle(2_000, 80, 85, 70), open: 95 }];
     const openTrade = {
       _id: 'trade1',
       symbol: 'BTCUSDT',

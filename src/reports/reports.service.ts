@@ -43,6 +43,9 @@ export class ReportsService {
           exitReason: t.exitReason,
           side: t.side,
           fees: t.fees ?? 0,
+          entryPrice: t.entryPrice,
+          stopLoss: t.stopLoss,
+          qty: t.qty,
         })),
         initialBalance,
       );

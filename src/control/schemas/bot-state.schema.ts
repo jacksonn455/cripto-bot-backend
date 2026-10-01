@@ -18,6 +18,15 @@ export class BotState {
   @Prop({ default: true })
   lastReconciliationOk: boolean;
 
+  /**
+   * Set by every manual resume. The consecutive-stop streak only counts trades closed after it, so
+   * a resume really lets the bot trade again (before, the old streak kept vetoing every entry).
+   * Persisted, not in memory: a process restart (e.g. Render redeploy) must NOT clear the streak,
+   * or each restart would silently switch the safety limit off. Absent = never resumed.
+   */
+  @Prop()
+  stopStreakResetAt?: Date;
+
   @Prop({ required: true, default: () => new Date() })
   updatedAt: Date;
 }

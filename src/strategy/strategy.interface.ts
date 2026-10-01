@@ -6,6 +6,8 @@ export interface OpenPositionInfo {
   side: 'LONG' | 'SHORT';
   entryPrice: number;
   stopLoss: number;
+  /** Close time (ms) of the entry candle; needed by the since-entry trailing stop. */
+  entryTime?: number;
 }
 
 export interface StrategyContext {
@@ -26,6 +28,11 @@ export interface Signal {
   price: number;
   stopLoss?: number;
   takeProfit?: number;
+  /**
+   * With an open position and no exit: the level the protective stop should move to (it only ever
+   * tightens; the caller ignores a looser one). Only the since-entry trailing mode sets it.
+   */
+  trailingStop?: number;
   indicators: Record<string, number | undefined>;
   reason: string;
 }
@@ -54,6 +61,37 @@ export interface StrategyParamSpec {
   min: number;
   max: number;
   integer: boolean;
+  /**
+   * Value at which the knob is off (e.g. a filter threshold of 0). At that value it is left out of
+   * the backtest params hash, so adding a new, disabled knob doesn't make old runs look different.
+   */
+  neutral?: number;
+  /** Only meaningful while this other param is not at its neutral value (left out of the hash otherwise). */
+  requires?: string;
+  /** Used when the config has no value for the key. */
+  default?: number;
+}
+
+/**
+ * The params that actually change the strategy's behavior: knobs at their neutral value, and knobs
+ * whose `requires` param is neutral, are dropped. This is what goes into the backtest params hash.
+ */
+export function effectiveStrategyParams(
+  spec: readonly StrategyParamSpec[],
+  params: Record<string, number>,
+): Record<string, number> {
+  const isNeutral = (key: string) => {
+    const s = spec.find((p) => p.key === key);
+    return s?.neutral !== undefined && params[key] === s.neutral;
+  };
+  return Object.fromEntries(
+    Object.entries(params).filter(([key]) => {
+      const s = spec.find((p) => p.key === key);
+      if (!s) return true;
+      if (isNeutral(key)) return false;
+      return !(s.requires && isNeutral(s.requires));
+    }),
+  );
 }
 
 export class StrategyParamsError extends Error {

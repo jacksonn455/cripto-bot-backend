@@ -24,6 +24,15 @@ export interface RiskContext {
    * Binance Spot can't; the paper gateway and backtests simulate it. Absent = not supported.
    */
   shortSellingSupported?: boolean;
+  /**
+   * Cap on the summed initial risk (qty × |entry − stop|) of the open positions on the same side,
+   * new entry included, as a fraction of accountEquity (0.015 = 1.5%). BTC and ETH move together,
+   * so two longs are close to one bet at twice the risk. Absent = no cap (only the backtest's
+   * portfolio mode sets it for now; production stays unchanged until the experiment says otherwise).
+   */
+  maxSameSideRiskPct?: number;
+  /** Initial risk of the open positions per side, in quote currency. Needed by maxSameSideRiskPct. */
+  openRiskBySide?: { LONG: number; SHORT: number };
 }
 
 export type RejectReason =
@@ -37,6 +46,7 @@ export type RejectReason =
   | 'INVALID_STOP_DISTANCE'
   | 'INVALID_TAKE_PROFIT'
   | 'MAX_EXPOSURE_EXCEEDED'
+  | 'AGGREGATE_RISK_LIMIT'
   | 'RR_TOO_LOW'
   | 'LOW_LIQUIDITY'
   | 'SPREAD_TOO_WIDE'

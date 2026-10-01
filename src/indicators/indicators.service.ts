@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { ATR, EMA, RSI } from 'technicalindicators';
+import { ADX, ATR, EMA, RSI } from 'technicalindicators';
 
 /**
  * Wraps `technicalindicators` and left-pads results with `undefined` so the
@@ -18,6 +18,12 @@ export class IndicatorsService {
   atr(period: number, highs: number[], lows: number[], closes: number[]): Array<number | undefined> {
     const result = ATR.calculate({ period, high: highs, low: lows, close: closes });
     return this.align(closes.length, result);
+  }
+
+  /** Wilder's ADX (trend strength, 0–100, direction-agnostic). */
+  adx(period: number, highs: number[], lows: number[], closes: number[]): Array<number | undefined> {
+    const result = ADX.calculate({ period, high: highs, low: lows, close: closes });
+    return this.align(closes.length, result.map((r) => r.adx));
   }
 
   private align(inputLength: number, result: number[]): Array<number | undefined> {

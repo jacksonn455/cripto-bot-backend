@@ -283,5 +283,176 @@ describe('BacktestRunner', () => {
       expect(baseline.trades.filter((t) => t.side === 'SHORT')).toHaveLength(0);
       expect(baseline.signals.some((sg) => sg.action === 'ENTER_SHORT')).toBe(false);
     });
+
+    it('charges the real funding when a history is given: positive funding is income for a short', () => {
+      const withoutCarry = runShort({}).trades[0];
+      const runner = new BacktestRunner(shortStrategy(), new RiskManagerService(PERMISSIVE_RISK_CONFIG), { ...baseParams, feesPct: 0 });
+      // One settlement while the short is open (between the candle-6 entry and the candle-7 stop).
+      const fundingEvents = [
+        { time: 0, rate: 0.5 }, // before the entry: ignored
+        { time: 7 * 60_000, rate: 0.001 },
+      ];
+      const trade = runner.runPortfolio([{ symbol: 'BTCUSDT', candles: DEATH_CROSS, fundingEvents }]).trades[0];
+      const notional = trade.entryPrice * trade.qty;
+      expect(trade.carryCost).toBeCloseTo(-0.001 * notional);
+      expect(trade.pnl).toBeCloseTo(withoutCarry.pnl + 0.001 * notional);
+    });
+  });
+
+  describe('stop fills', () => {
+    it('fills a stop gapped through at the candle open and reports the gap cost', () => {
+      // Candle 7 opens at 60, below the ~71.9 stop: a stop-market order fills at 60, not at the stop.
+      const gapped = [...GOLDEN_CROSS.slice(0, 7), { ...candle(7, 80, 82, 50), open: 60 }];
+      const trade = run({ feesPct: 0 }, gapped).trades[0];
+      expect(trade.exitReason).toBe('SL');
+      expect(trade.stopLoss).toBeGreaterThan(60);
+      expect(trade.exitPrice).toBe(60);
+      expect(trade.gapCost).toBeCloseTo((trade.stopLoss - 60) * trade.qty);
+      expect(trade.pnl).toBeLessThan(-100);
+    });
+
+    it('has no gap cost when the stop is reached inside the candle', () => {
+      expect(run({ feesPct: 0 }).trades[0].gapCost).toBe(0);
+    });
+
+    it('applies stopSlippagePct to stop exits only', () => {
+      const trade = run({ feesPct: 0, slippagePct: 0, stopSlippagePct: 0.01 }).trades[0];
+      expect(trade.entryPrice).toBe(90);
+      expect(trade.exitPrice).toBeCloseTo(trade.stopLoss * 0.99);
+    });
+  });
+
+  describe('portfolio mode (runPortfolio: one shared balance)', () => {
+    const twoSymbols = (params: Partial<BacktestParams> = {}) =>
+      new BacktestRunner(
+        new TrendRegimeStrategy(new IndicatorsService(), TINY_STRATEGY_CONFIG),
+        new RiskManagerService(PERMISSIVE_RISK_CONFIG),
+        { ...baseParams, feesPct: 0, ...params },
+      ).runPortfolio([
+        { symbol: 'BTCUSDT', candles: GOLDEN_CROSS },
+        { symbol: 'ETHUSDT', candles: GOLDEN_CROSS },
+      ]);
+
+    it('holds both positions at once on the same balance', () => {
+      const result = twoSymbols();
+      expect(result.trades.map((t) => t.symbol).sort()).toEqual(['BTCUSDT', 'ETHUSDT']);
+      expect(result.trades[0].qty).toBeCloseTo(result.trades[1].qty);
+      expect(Math.max(...result.equityCurve.map((p) => p.openPositions))).toBe(2);
+      expect(result.finalBalance).toBeCloseTo(10000 + result.trades.reduce((sum, t) => sum + t.pnl, 0));
+    });
+
+    it('shrinks the second same-side entry to fit maxSameSideRiskPct', () => {
+      // 1% risk each; a 1.5% cap leaves half a position for the second symbol.
+      const result = twoSymbols({ maxSameSideRiskPct: 0.015 });
+      const [first, second] = ['BTCUSDT', 'ETHUSDT'].map((s) => result.trades.find((t) => t.symbol === s)!);
+      expect(second.qty).toBeCloseTo(first.qty / 2);
+    });
+
+    it('vetoes the second entry with AGGREGATE_RISK_LIMIT when the first uses the whole budget', () => {
+      const result = twoSymbols({ maxSameSideRiskPct: 0.01 });
+      expect(result.trades).toHaveLength(1);
+      const vetoed = result.signals.find((sg) => !sg.approved);
+      expect(vetoed).toMatchObject({ symbol: 'ETHUSDT', rejectReason: 'AGGREGATE_RISK_LIMIT' });
+    });
+
+    it('is exactly the single-symbol run with one symbol', () => {
+      const single = run({ feesPct: 0.001 });
+      const portfolio = new BacktestRunner(
+        new TrendRegimeStrategy(new IndicatorsService(), TINY_STRATEGY_CONFIG),
+        new RiskManagerService(PERMISSIVE_RISK_CONFIG),
+        { ...baseParams, feesPct: 0.001 },
+      ).runPortfolio([{ symbol: 'BTCUSDT', candles: GOLDEN_CROSS }]);
+      expect(portfolio).toEqual(single);
+    });
+  });
+});
+
+describe('BacktestRunner consecutive-stops pause', () => {
+  // Always wants in; every next candle crashes through the stop: an endless stop-out streak.
+  const H = 3_600_000;
+  const hourly = (i: number): Candle => ({
+    symbol: 'BTCUSDT', interval: '1h', openTime: i * H, open: 100, high: 101, low: i % 2 ? 50 : 99, close: 100,
+    volume: 1, closeTime: i * H + H - 1, quoteVolume: 100, trades: 1, isClosed: true,
+  });
+  const alwaysLong = {
+    name: 'AlwaysLong',
+    onCandleClosed: (ctx: { candles: Candle[]; symbol: string; openPosition?: unknown }) => {
+      const last = ctx.candles[ctx.candles.length - 1];
+      return ctx.openPosition
+        ? { action: 'NONE' as const, symbol: ctx.symbol, strategy: 'AlwaysLong', candleTime: last.closeTime, price: last.close, indicators: {}, reason: '' }
+        : { action: 'ENTER_LONG' as const, symbol: ctx.symbol, strategy: 'AlwaysLong', candleTime: last.closeTime, price: last.close, stopLoss: 95, indicators: {}, reason: '' };
+    },
+  };
+
+  it('lifts the pause at the next UTC day instead of blocking entries for the rest of the run', () => {
+    const candles = Array.from({ length: 72 }, (_, i) => hourly(i)); // 3 days
+    const result = new BacktestRunner(alwaysLong, new RiskManagerService({ ...PERMISSIVE_RISK_CONFIG, maxConsecutiveStops: 1 }), {
+      strategy: 'AlwaysLong', symbol: 'BTCUSDT', initialBalance: 10_000, feesPct: 0, slippagePct: 0,
+    }).run(candles);
+    // One stop per day: paused after it, resumed the next day.
+    expect(result.trades.map((t) => new Date(t.entryTime).toISOString().slice(0, 10))).toEqual(['1970-01-01', '1970-01-02', '1970-01-03']);
+    expect(result.stopPauses).toBe(2);
+    expect(result.signals.some((s) => s.rejectReason === 'CONSECUTIVE_STOPS_LIMIT')).toBe(true);
+  });
+});
+
+describe('BacktestRunner research engine options', () => {
+  const H = 3_600_000;
+  const bar = (i: number, close: number, low = close - 0.5): Candle => ({
+    symbol: 'BTCUSDT', interval: '1h', openTime: i * H, open: close, high: close + 0.5, low, close,
+    volume: 1, closeTime: i * H + H - 1, quoteVolume: close, trades: 1, isClosed: true,
+  });
+  const risk = new RiskManagerService(PERMISSIVE_RISK_CONFIG);
+  const params: BacktestParams = { strategy: 'S', symbol: 'BTCUSDT', initialBalance: 10_000, feesPct: 0, slippagePct: 0 };
+
+  /** Enters once at 100 (stop 90), then proposes `trail(close)` as the trailing level every candle. */
+  const trailer = (trail: (close: number) => number) => {
+    let entered = false;
+    return {
+      name: 'Trailer',
+      onCandleClosed: (ctx: { candles: Candle[]; symbol: string; openPosition?: unknown }) => {
+        const last = ctx.candles[ctx.candles.length - 1];
+        const base = { symbol: ctx.symbol, strategy: 'Trailer', candleTime: last.closeTime, price: last.close, indicators: {}, reason: '' };
+        if (ctx.openPosition) return { ...base, action: 'NONE' as const, trailingStop: trail(last.close) };
+        if (entered) return { ...base, action: 'NONE' as const };
+        entered = true;
+        return { ...base, action: 'ENTER_LONG' as const, stopLoss: 90 };
+      },
+    };
+  };
+
+  it('ratchets the stop up and exits as TRAILING inside the candle that breaks it', () => {
+    // Entry 100; closes 104, 108 move the stop to 102, 106; candle 3 dips to 105 → out at 106.
+    const candles = [bar(0, 100), bar(1, 104), bar(2, 108), bar(3, 107, 105)];
+    const [trade] = new BacktestRunner(trailer((c) => c - 2), risk, params).run(candles).trades;
+    expect(trade.exitReason).toBe('TRAILING');
+    expect(trade.exitPrice).toBe(106);
+    expect(trade.pnl).toBeGreaterThan(0);
+    // The trade keeps the stop it was sized on, so R = pnl ÷ planned risk: (106 − 100) ÷ (100 − 90) = 0.6R.
+    expect(trade.stopLoss).toBe(90);
+  });
+
+  it('never loosens the stop when the proposed level is lower', () => {
+    // Candle 2 closes at 103 (level would fall to 101): the stop stays at 102 and candle 3 hits it.
+    const candles = [bar(0, 100), bar(1, 104), bar(2, 103, 102.5), bar(3, 103, 101.5)];
+    const [trade] = new BacktestRunner(trailer((c) => c - 2), risk, params).run(candles).trades;
+    expect(trade.exitPrice).toBe(102);
+  });
+
+  it('feeds the strategy regimeLookback regime candles instead of candleLookback', () => {
+    const seen: number[] = [];
+    const spy = {
+      name: 'Spy',
+      onCandleClosed: (ctx: { candles: Candle[]; regimeCandles?: Candle[]; symbol: string }) => {
+        seen.push(ctx.regimeCandles?.length ?? -1);
+        return { action: 'NONE' as const, symbol: ctx.symbol, strategy: 'Spy', candleTime: 0, price: 0, indicators: {}, reason: '' };
+      },
+    };
+    const candles = Array.from({ length: 10 }, (_, i) => bar(i, 100));
+    new BacktestRunner(spy, risk, { ...params, candleLookback: 2, regimeLookback: 5 }).run(candles, candles);
+    expect(Math.max(...seen)).toBe(5);
+    seen.length = 0;
+    new BacktestRunner(spy, risk, { ...params, candleLookback: 2 }).run(candles, candles);
+    expect(Math.max(...seen)).toBe(2);
   });
 });

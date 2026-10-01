@@ -69,5 +69,51 @@ describe('computeMetrics', () => {
     expect(empty.winRate).toBe(0);
     expect(empty.profitFactor).toBe(0);
     expect(empty.maxDrawdown).toBe(0);
+    expect(empty.rStats).toBeUndefined();
+  });
+
+  it('has no R stats when the trades carry no stop/qty (older data)', () => {
+    expect(metrics.rStats).toBeUndefined();
+  });
+
+  describe('R multiples (pnl ÷ initial risk)', () => {
+    // Entry 100, stop 90, qty 1 → 10 of risk per trade.
+    const rTrades = [30, -10, -12, 5, 20].map((pnl, i) => ({
+      pnl,
+      pnlPct: pnl,
+      entryTime: i * 1000,
+      exitTime: i * 1000 + 500,
+      entryPrice: 100,
+      stopLoss: 90,
+      qty: 1,
+    }));
+    const r = computeMetrics(rTrades, 1000).rStats!;
+
+    it('summarizes the R distribution', () => {
+      expect(r.tradeCount).toBe(5);
+      expect(r.avgR).toBeCloseTo(0.66);
+      expect(r.medianR).toBeCloseTo(0.5);
+      expect(r.bestR).toBeCloseTo(3);
+      expect(r.worstR).toBeCloseTo(-1.2);
+      expect(r.tradesAtLeast3R).toBe(1);
+      expect(r.rHistogram).toEqual([
+        { bucket: '< -1R', count: 1 },
+        { bucket: '-1R a 0R', count: 1 },
+        { bucket: '0R a 1R', count: 1 },
+        { bucket: '1R a 2R', count: 0 },
+        { bucket: '2R a 3R', count: 1 },
+        { bucket: '>= 3R', count: 1 },
+      ]);
+    });
+
+    it('measures how much of the gross profit the best 10% of trades made', () => {
+      // Best trade (30) of a gross profit of 55 (30 + 5 + 20).
+      expect(r.topDecilePnlShare).toBeCloseTo(30 / 55);
+    });
+
+    it('computes the implied Kelly fraction: W − (1 − W) ÷ (avg win R ÷ avg loss R)', () => {
+      // W = 0.6, avg win 1.8333R, avg loss 1.1R → 0.6 − 0.4 ÷ 1.6667 = 0.36
+      expect(r.kellyFraction).toBeCloseTo(0.36);
+    });
   });
 });

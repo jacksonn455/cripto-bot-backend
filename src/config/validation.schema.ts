@@ -71,6 +71,10 @@ export const validationSchema = Joi.object({
   TREND_ATR_STOP_MULT: Joi.number().positive().default(2),
   TREND_CHANDELIER_LOOKBACK: Joi.number().integer().positive().default(22),
   TREND_CHANDELIER_ATR_MULT: Joi.number().positive().default(3),
+  // Research knobs, off by default (0): ADX trend-strength filter and a band around the regime EMA.
+  TREND_ADX_PERIOD: Joi.number().integer().min(2).max(100).default(14),
+  TREND_ADX_MIN: Joi.number().min(0).max(100).default(0),
+  TREND_REGIME_BAND_PCT: Joi.number().min(0).max(0.2).default(0),
 
   // --- RiskManager ---
   RISK_PER_TRADE_PCT: Joi.number().positive().max(1).default(0.01),

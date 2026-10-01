@@ -10,7 +10,7 @@ function makeBuilder(openTrades: unknown[]) {
   const tradeModel = {
     find: jest.fn((filter: { status: string }) => query(filter.status === 'OPEN' ? openTrades : [])),
   };
-  const controlService = { isPaused: jest.fn().mockResolvedValue(false) };
+  const controlService = { getState: jest.fn().mockResolvedValue({ isPaused: false }) };
   return new RiskContextBuilderService(tradeModel as never, controlService as never);
 }
 

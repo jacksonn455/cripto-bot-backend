@@ -17,6 +17,11 @@ export class RiskManagerService {
     private readonly config: ReturnType<typeof riskConfig>,
   ) {}
 
+  /** Stops in a row that veto new entries (CONSECUTIVE_STOPS_LIMIT). */
+  get maxConsecutiveStops(): number {
+    return this.config.maxConsecutiveStops;
+  }
+
   evaluate(signal: Signal, ctx: RiskContext): RiskDecision {
     const side = sideFromSignal(signal.action);
     if (!side) {
@@ -67,6 +72,15 @@ export class RiskManagerService {
 
     const riskAmount = ctx.accountEquity * this.config.riskPerTradePct;
     let qty = riskAmount / riskPerUnit;
+
+    if (ctx.maxSameSideRiskPct !== undefined) {
+      const openRisk = ctx.openRiskBySide?.[side] ?? 0;
+      const budget = ctx.accountEquity * ctx.maxSameSideRiskPct - openRisk;
+      // Tolerance: a full budget minus float rounding (~1e-14) must not open a dust-sized position.
+      if (budget <= ctx.accountEquity * 1e-9) return this.reject('AGGREGATE_RISK_LIMIT');
+      // Shrink the entry to what's left of the budget instead of skipping it altogether.
+      qty = Math.min(qty, budget / riskPerUnit);
+    }
 
     const maxAssetNotional = ctx.accountEquity * this.config.maxExposurePerAssetPct;
     const currentAssetExposure = ctx.currentExposureByAsset[signal.symbol] ?? 0;

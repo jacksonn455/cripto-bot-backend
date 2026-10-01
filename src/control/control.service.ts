@@ -106,10 +106,12 @@ export class ControlService {
   }
 
   async resume(): Promise<void> {
+    const now = new Date();
     await this.stateModel.updateOne(
       {},
       // $set with undefined is dropped by Mongoose, so the old reason must be removed explicitly.
-      { $set: { isPaused: false, updatedAt: new Date() }, $unset: { pauseReason: 1 } },
+      // A resume also starts the consecutive-stop streak over (see BotState.stopStreakResetAt).
+      { $set: { isPaused: false, stopStreakResetAt: now, updatedAt: now }, $unset: { pauseReason: 1 } },
       { upsert: true },
     );
     this.logger.log('Bot resumed');

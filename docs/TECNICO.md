@@ -236,6 +236,53 @@ Relatórios: `summary.bySide.{LONG,SHORT}`, `longCount/shortCount`, `GET /report
 em `/reports/*` e `/trades`. Eventos `trade.opened/closed` agora carregam lado, estratégia, timeframe,
 preços, quantidade, PnL, % e motivo.
 
+## Trava de stops consecutivos
+
+Depois de `RISK_MAX_CONSECUTIVE_STOPS` (padrão 3) saídas por stop seguidas, o `RiskManager` veta novas entradas
+(`CONSECUTIVE_STOPS_LIMIT`) e o `ControlService` auto-pausa o bot. A regra da sequência é uma só,
+[`stop-streak.util.ts`](../src/risk/stop-streak.util.ts): uma saída por stop soma 1; qualquer outra saída zera.
+
+- **Paper/Live:** a sequência é contada a partir das trades fechadas no Mongo **depois de `bot_state.stopStreakResetAt`**,
+  que `POST /bot/resume` grava. Retomar o bot zera a sequência. Antes, o bot continuava vetando para sempre mesmo depois de
+  retomado, porque os mesmos 3 stops continuavam sendo os mais recentes. O marco fica no Mongo, então um restart do
+  processo (deploy no Render) não zera nem desfaz nada. Posições abertas não são afetadas: a trava só bloqueia entradas.
+- **Backtest:** ninguém retoma uma simulação, então a pausa dura até o próximo dia UTC (`stopPauses` na execução). Antes ela
+  nunca acabava: o backtest de BTCUSDT de 01/04 a 30/09/2026 parou de operar depois do 3º stop, em 20/04.
+- Depois do deploy, um bot que já estava travado continua travado até a primeira retomada manual (comportamento correto).
+
+## Motor de backtest v2 e opções de pesquisa
+
+`engineVersion: 2` em cada execução. Execuções de versões diferentes não se comparam: a tela de comparação e o PBO avisam.
+
+- Um stop atravessado por gap preenche na **abertura** do candle (`costs.totalGapCost`, `costs.gappedStops`); antes,
+  preenchia no preço do stop. Vale também para o stop local do PAPER.
+- A pausa por stops seguidos expira no dia seguinte (acima).
+- `stopSlippagePct`: slippage só das saídas por stop (inclusive trailing).
+- `portfolioMode: true`: todos os símbolos num saldo único e num relógio comum, como o loop ao vivo. Combinado com
+  `maxSameSideRiskPct`, limita o risco somado no mesmo sentido (veto `AGGREGATE_RISK_LIMIT`).
+- `shortCarryModel: "funding"`: custo do short pelo funding histórico real do perpétuo (`funding_history`, cache de
+  `/fapi/v1/fundingRate`).
+- `regimeLookback`: candles de regime vistos por passo. O padrão é a janela do loop ao vivo (210), com a qual a "EMA200"
+  fica perto de uma média simples. A variante de pesquisa V1 usa 1000.
+- Parâmetros de estratégia só para pesquisa (fixos em 0 na config, **sem variável de ambiente**, para o paper/live não
+  mudarem): `trailingMode` (1 = stop desde a entrada, dentro do candle, saída `TRAILING`) e `pullbackLookback`
+  (entrada por pullback, regra em `ESTRATEGIA-PESQUISA.md` §5). Também `adxMin`/`adxPeriod` e `regimeBandPct`, desligados (0).
+- Cada execução grava `riskAdjusted`: Sharpe/Sortino diários anualizados com 365 dias, Calmar, CAGR, volatilidade, PSR,
+  assimetria e curtose. Na leitura, `overfitting` traz o Sharpe deflacionado (N = combinações testadas da estratégia,
+  variância entre os Sharpes delas), o Sharpe esperado por sorte e o haircut de Harvey & Liu (Bonferroni).
+- Resumos com `rStats`: R médio, mediana, histograma em R, trades ≥ 3R, fatia do lucro bruto dos 10% melhores trades e
+  Kelly implícito (só diagnóstico).
+- Janelas de walk-forward com `startBalance` e `returnPct`.
+
+Endpoints novos:
+- `GET /backtest/compare?baseline=&variant=`: janela a janela, fração das janelas em que a variante venceu (retorno,
+  PF, expectância, e PF e expectância juntos), avisos de comparabilidade e "inconclusivo" com menos de 30 trades por lado.
+- `GET /backtest/pbo?runIds=a,b,c`: Probability of Backtest Overfitting (CSCV) sobre 2 a 20 execuções com as mesmas janelas.
+
+Harness da pesquisa: [`src/research/variants.research.spec.ts`](../src/research/variants.research.spec.ts).
+`RUN_RESEARCH=1 pnpm test -- src/research` roda o protocolo V0–V3 inteiro com candles reais e sem banco, e grava
+`docs/research/variants-results.json`. Fora isso, fica pulado.
+
 ## Notificações (Discord / Telegram)
 
 A lógica de trading só emite eventos de domínio (`trade.opened`, `trade.closed`, `alert.critical`,

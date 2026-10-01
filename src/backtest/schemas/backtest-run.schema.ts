@@ -65,7 +65,33 @@ export class BacktestRun {
     /** Short carry (borrow/funding) part of totalFees. */
     totalShortCarry?: number;
     shortBorrowPctPerDay?: number;
+    /** Extra loss from stops filled at the open of a candle that gapped through them. */
+    totalGapCost?: number;
+    gappedStops?: number;
+    /** Stop-exit slippage when it differs from slippagePct. */
+    stopSlippagePct?: number;
+    shortCarryModel?: 'fixed' | 'funding';
+    /** With shortCarryModel=funding: symbols without funding history (charged the fixed rate). */
+    fundingFallbackSymbols?: string[];
   };
+
+  /**
+   * Daily, annualized metrics from the equity curve (Sharpe, Sortino, Calmar, PSR…); see
+   * reports/risk-adjusted.util.ts. Absent on older runs.
+   */
+  @Prop({ type: Object })
+  riskAdjusted?: Record<string, unknown>;
+
+  /**
+   * Version of the simulation rules. Runs from different versions aren't directly comparable
+   * (v2: stops gapped through fill at the open). Absent = 1.
+   */
+  @Prop()
+  engineVersion?: number;
+
+  /** Times the consecutive-stops pause hit and was lifted at the next UTC day. Absent on older runs. */
+  @Prop()
+  stopPauses?: number;
 
   /** Fraction of the simulated candles with an open position (0–1), averaged across symbols. */
   @Prop()
