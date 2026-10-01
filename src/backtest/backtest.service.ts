@@ -320,6 +320,15 @@ export class BacktestService {
       timeframe: dto.timeframe,
       tradeCount: allTrades.length,
       totalPnl: summary.totalPnl,
+      // Headline metrics for the Discord "backtest concluído" message.
+      from: dto.from,
+      to: dto.to,
+      initialBalance: dto.initialBalance,
+      winRate: summary.winRate,
+      profitFactor: summary.profitFactor,
+      maxDrawdownPct: summary.maxDrawdownPct,
+      sharpe: summary.sharpe,
+      totalFees: summary.totalFees,
     });
 
     return {

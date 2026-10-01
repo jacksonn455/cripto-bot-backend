@@ -38,6 +38,7 @@ const COLORS = {
   critical: 0xe74c3c,
   recovery: 0x2ecc71,
   restart: 0x3498db,
+  neutral: 0x3498db,
 };
 
 const OPS_ICONS = { incident: '🚨', recovery: '✅', restart: '🔄' } as const;
@@ -67,6 +68,18 @@ function buildEmbed(notification: Notification): DiscordEmbed {
       fields: n.fields.map(([name, value]) => field(name, value)),
       footer: { text: `incidente ${n.incidentKey}` },
       timestamp: n.at,
+    };
+  }
+
+  if (notification.kind === 'report') {
+    const r = notification.report;
+    return {
+      title: `${r.icon} KRYPTO — ${r.headline}`,
+      description: r.summary,
+      color: r.tone === 'profit' ? COLORS.profit : r.tone === 'loss' ? COLORS.loss : COLORS[r.tone],
+      fields: r.fields.map(([name, value]) => field(name, value)),
+      ...(r.footer ? { footer: { text: r.footer } } : {}),
+      timestamp: r.at,
     };
   }
 

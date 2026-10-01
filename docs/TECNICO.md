@@ -304,7 +304,20 @@ notifications/
   do Discord e o `allowed_mentions` é vazio (nada pinga @everyone).
 - **Telegram**: mantém o comportamento anterior (liga com token + chat; só alertas por padrão). Agora com
   timeout e checagem da resposta.
-- `DISCORD_EVENTS` / `TELEGRAM_EVENTS` escolhem as categorias `alerts` e/ou `trades` por canal.
+- `DISCORD_EVENTS` / `TELEGRAM_EVENTS` escolhem as categorias por canal: `alerts` (alerta crítico, pausa,
+  retomada), `trades` (abertura/fechamento), `reports` (resumo diário e backtest concluído) e `signals`
+  (sinais de entrada vetados pelo risco). Incidentes operacionais seguem em `DISCORD_ALERTS_ENABLED`.
+- **Resumo diário** (`notifications/daily-report/`): às `DAILY_REPORT_HOUR` no fuso `NOTIFICATIONS_TIME_ZONE`
+  manda PnL realizado, trades, win rate, taxas, equity e variação em 24h, posições abertas, avaliações,
+  sinais aprovados/vetados, incidentes ativos e estado do worker/bot. Também é o heartbeat diário: se a
+  mensagem não chegar de manhã, algo está errado. Se o processo estava fora na hora marcada, o resumo sai
+  assim que ele volta no mesmo dia. A coleção `daily_report_runs` (um documento por dia local) impede envio
+  duplicado após restart.
+- **Sinais vetados** (`SignalVetoDigestService`): agrupados em uma mensagem por janela de
+  `SIGNAL_VETO_DIGEST_MINUTES` (contagem por motivo + últimos sinais). Sinais aprovados viram `trade.opened`.
+- **Backtest concluído**: PnL, trades, win rate, profit factor, max drawdown, Sharpe e taxas.
+- `bot.error` **não** vai para o Discord: as mesmas falhas do ciclo já viram incidente `EVALUATION`/`MARKET_DATA`
+  (com limiar e cooldown), e mandar os dois duplicaria a mensagem.
 - **Resiliência**: timeout por tentativa (`NOTIFICATIONS_TIMEOUT_MS`). Retry único só em 5xx, erro de conexão
   e 429 com `retry_after` ≤ 5 s. **Não** há retry em timeout, porque a mensagem pode ter sido entregue e uma
   duplicada é pior. Um 401/403/404 desliga o Discord até o próximo restart (webhook apagado ou URL errada). Os
@@ -361,10 +374,13 @@ ai/
 | `DISCORD_ENABLED` | não | `false` | Liga o canal Discord |
 | `DISCORD_WEBHOOK_URL` | sim, se `DISCORD_ENABLED=true` | — | URL do webhook (secreta) |
 | `DISCORD_USERNAME` | não | `Trade Bot` | Nome exibido nas mensagens |
-| `DISCORD_EVENTS` | não | `alerts,trades` | Categorias enviadas ao Discord |
+| `DISCORD_EVENTS` | não | `alerts,trades,reports,signals` | Categorias enviadas ao Discord |
 | `TELEGRAM_ENABLED` | não | `true` | `false` desliga o Telegram mesmo com token/chat |
 | `TELEGRAM_EVENTS` | não | `alerts` | Categorias enviadas ao Telegram |
 | `NOTIFICATIONS_TIMEOUT_MS` | não | `5000` | Timeout por tentativa HTTP dos canais |
+| `DAILY_REPORT_ENABLED` | não | `true` | Liga o resumo diário (categoria `reports`) |
+| `DAILY_REPORT_HOUR` | não | `8` | Hora local (0–23, fuso `NOTIFICATIONS_TIME_ZONE`) do resumo diário |
+| `SIGNAL_VETO_DIGEST_MINUTES` | não | `60` | Janela de agrupamento dos sinais vetados (0 = um por veto) |
 | `REDIS_ENABLED` | não | `true` | `false` desliga o cache (equivale a `REDIS_URL=`) |
 | `REDIS_COMMAND_TIMEOUT_MS` | não | `500` | Timeout por comando Redis |
 | `REDIS_CONNECT_TIMEOUT_MS` | não | `2000` | Timeout de conexão |

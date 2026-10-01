@@ -11,7 +11,7 @@ describe('validationSchema (new integrations)', () => {
       OPENAI_AGENTS_ENABLED: false,
       REDIS_ENABLED: true,
       TELEGRAM_EVENTS: 'alerts',
-      DISCORD_EVENTS: 'alerts,trades',
+      DISCORD_EVENTS: 'alerts,trades,reports,signals',
     });
   });
 

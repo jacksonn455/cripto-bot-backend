@@ -106,13 +106,15 @@ export const controlConfig = registerAs('control', () => ({
 }));
 
 /** Which domain events a channel receives: `alerts` (critical/pause/resume) and/or `trades` (open/close). */
-export type NotificationCategory = 'alerts' | 'trades';
+/** alerts = incidents/pauses, trades = open/close, reports = daily report + backtests, signals = risk vetoes. */
+export type NotificationCategory = 'alerts' | 'trades' | 'reports' | 'signals';
+const NOTIFICATION_CATEGORIES: readonly string[] = ['alerts', 'trades', 'reports', 'signals'];
 
 function parseCategories(raw: string | undefined, fallback: string): NotificationCategory[] {
   return (raw ?? fallback)
     .split(',')
     .map((c) => c.trim().toLowerCase())
-    .filter((c): c is NotificationCategory => c === 'alerts' || c === 'trades');
+    .filter((c): c is NotificationCategory => NOTIFICATION_CATEGORIES.includes(c));
 }
 
 export const notificationsConfig = registerAs('notifications', () => ({
@@ -124,7 +126,7 @@ export const notificationsConfig = registerAs('notifications', () => ({
   discordEnabled: process.env.DISCORD_ENABLED === 'true',
   discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL ?? '',
   discordUsername: process.env.DISCORD_USERNAME ?? 'Trade Bot',
-  discordEvents: parseCategories(process.env.DISCORD_EVENTS, 'alerts,trades'),
+  discordEvents: parseCategories(process.env.DISCORD_EVENTS, 'alerts,trades,reports,signals'),
   // Per HTTP attempt; a slow chat API can never hold a trade cycle (delivery is fire-and-forget anyway).
   timeoutMs: parseInt(process.env.NOTIFICATIONS_TIMEOUT_MS ?? '5000', 10),
   // Clock times inside alert messages (worker offline/recovered) are written in this zone.
@@ -139,6 +141,11 @@ export const notificationsConfig = registerAs('notifications', () => ({
   incidentFailureThreshold: parseInt(process.env.INCIDENT_FAILURE_THRESHOLD ?? '3', 10),
   // Shown as "Ambiente" in incident notices (defaults to NODE_ENV).
   environment: (process.env.KRYPTO_ENVIRONMENT ?? process.env.NODE_ENV ?? 'development').toUpperCase(),
+  // Daily report (PnL, trades, equity, worker liveness) at this hour of NOTIFICATIONS_TIME_ZONE.
+  dailyReportEnabled: process.env.DAILY_REPORT_ENABLED !== 'false',
+  dailyReportHour: parseInt(process.env.DAILY_REPORT_HOUR ?? '8', 10),
+  // Risk-vetoed entry signals are grouped into one message per window (0 = one message per veto).
+  signalVetoDigestMinutes: parseInt(process.env.SIGNAL_VETO_DIGEST_MINUTES ?? '60', 10),
 }));
 
 export const fundingConfig = registerAs('funding', () => ({

@@ -23,10 +23,30 @@ export interface OpsNotice {
   at: string;
 }
 
+/**
+ * Periodic or informational summary (daily report, backtest finished, batched risk vetoes).
+ * `category` routes it: reports and signals are separate opt-ins in DISCORD_EVENTS/TELEGRAM_EVENTS.
+ */
+export interface ReportNotice {
+  category: 'reports' | 'signals';
+  /** Title after the icon, e.g. "Resumo diário". */
+  headline: string;
+  icon: string;
+  summary: string;
+  /** Embed color: profit = green, loss = red, warning = yellow, neutral = blue. */
+  tone: 'neutral' | 'profit' | 'loss' | 'warning';
+  /** Ordered facts shown as embed fields: [name, value]. */
+  fields: Array<[string, string]>;
+  footer?: string;
+  /** ISO time of the notice. */
+  at: string;
+}
+
 /** Everything a channel may be asked to deliver. Providers format each kind their own way. */
 export type Notification =
   | { kind: 'alert'; level: NotificationLevel; message: string }
   | { kind: 'ops'; notice: OpsNotice }
+  | { kind: 'report'; report: ReportNotice }
   | { kind: 'trade.opened'; trade: TradeOpenedEvent }
   | { kind: 'trade.closed'; trade: TradeClosedEvent };
 
@@ -53,6 +73,7 @@ export const NOTIFICATION_PROVIDERS = Symbol('NOTIFICATION_PROVIDERS');
 
 /** Ops notices count as `alerts` for channels filtered by category (Discord gates them with DISCORD_ALERTS_ENABLED). */
 export function categoryOf(notification: Notification): NotificationCategory {
+  if (notification.kind === 'report') return notification.report.category;
   return notification.kind === 'alert' || notification.kind === 'ops' ? 'alerts' : 'trades';
 }
 
@@ -60,6 +81,7 @@ export function categoryOf(notification: Notification): NotificationCategory {
 export function describeNotification(notification: Notification): string {
   if (notification.kind === 'alert') return `alert:${notification.level}`;
   if (notification.kind === 'ops') return `ops:${notification.notice.phase} ${notification.notice.incidentKey}`;
+  if (notification.kind === 'report') return `report:${notification.report.category} ${notification.report.headline}`;
   const t = notification.trade;
   return `${notification.kind} ${t.side} ${t.symbol}`;
 }

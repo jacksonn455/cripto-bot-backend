@@ -5,7 +5,8 @@ const DISCORD_WEBHOOK =
   /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+$/;
 const CORS_ORIGIN = String.raw`https?:\/\/[^\s,/*]+`;
 const CORS_ORIGIN_LIST = new RegExp(String.raw`^\s*${CORS_ORIGIN}\/?\s*(,\s*${CORS_ORIGIN}\/?\s*)*$`);
-const NOTIFICATION_EVENTS =/^\s*(alerts|trades)\s*(,\s*(alerts|trades)\s*)*$/i;
+const NOTIFICATION_EVENTS = /^\s*(alerts|trades|reports|signals)\s*(,\s*(alerts|trades|reports|signals)\s*)*$/i;
+const NOTIFICATION_EVENTS_MESSAGE = 'must be a comma-separated list of: alerts, trades, reports, signals';
 
 // Fails fast on boot if required env vars are missing or LIVE mode is misconfigured.
 export const validationSchema = Joi.object({
@@ -137,7 +138,7 @@ export const validationSchema = Joi.object({
   TELEGRAM_BOT_TOKEN: Joi.string().allow('').optional().default(''),
   TELEGRAM_CHAT_ID: Joi.string().allow('').optional().default(''),
   TELEGRAM_EVENTS: Joi.string().pattern(NOTIFICATION_EVENTS).default('alerts').messages({
-    'string.pattern.base': 'TELEGRAM_EVENTS must be a comma-separated list of: alerts, trades',
+    'string.pattern.base': `TELEGRAM_EVENTS ${NOTIFICATION_EVENTS_MESSAGE}`,
   }),
   DISCORD_ENABLED: Joi.boolean().default(false),
   DISCORD_WEBHOOK_URL: Joi.string().when('DISCORD_ENABLED', {
@@ -151,8 +152,8 @@ export const validationSchema = Joi.object({
     otherwise: Joi.string().allow('').optional().default(''),
   }),
   DISCORD_USERNAME: Joi.string().max(80).default('Trade Bot'),
-  DISCORD_EVENTS: Joi.string().pattern(NOTIFICATION_EVENTS).default('alerts,trades').messages({
-    'string.pattern.base': 'DISCORD_EVENTS must be a comma-separated list of: alerts, trades',
+  DISCORD_EVENTS: Joi.string().pattern(NOTIFICATION_EVENTS).default('alerts,trades,reports,signals').messages({
+    'string.pattern.base': `DISCORD_EVENTS ${NOTIFICATION_EVENTS_MESSAGE}`,
   }),
   NOTIFICATIONS_TIMEOUT_MS: Joi.number().integer().min(500).max(30000).default(5000),
   NOTIFICATIONS_TIME_ZONE: Joi.string().default('America/Sao_Paulo'),
@@ -160,6 +161,9 @@ export const validationSchema = Joi.object({
   DISCORD_ALERT_COOLDOWN_SECONDS: Joi.number().integer().min(0).default(300),
   INCIDENT_FAILURE_THRESHOLD: Joi.number().integer().min(1).max(100).default(3),
   KRYPTO_ENVIRONMENT: Joi.string().max(40).optional(),
+  DAILY_REPORT_ENABLED: Joi.boolean().default(true),
+  DAILY_REPORT_HOUR: Joi.number().integer().min(0).max(23).default(8),
+  SIGNAL_VETO_DIGEST_MINUTES: Joi.number().integer().min(0).max(1440).default(60),
 
   // --- Funding scanner (read-only) ---
   FUNDING_SCAN_ENABLED: Joi.boolean().default(true),

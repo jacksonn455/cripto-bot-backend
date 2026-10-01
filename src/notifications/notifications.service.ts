@@ -7,6 +7,7 @@ import {
   NOTIFICATION_PROVIDERS,
   type NotificationProvider,
 } from './notification.types';
+import { backtestCompletedNotice, type BacktestCompletedEvent } from './report-notices';
 
 
 /**
@@ -70,9 +71,15 @@ export class NotificationsService implements OnModuleInit {
     void this.dispatch({ kind: 'alert', level: 'info', message: 'Bot resumed' });
   }
 
+  @OnEvent('backtest.completed')
+  onBacktestCompleted(payload: BacktestCompletedEvent): void {
+    void this.dispatch({ kind: 'report', report: backtestCompletedNotice(payload) });
+  }
+
   private summary(notification: Notification): string {
     if (notification.kind === 'alert') return `: ${notification.message}`;
     if (notification.kind === 'ops') return `: ${notification.notice.headline} - ${notification.notice.summary}`;
+    if (notification.kind === 'report') return `: ${notification.report.summary}`;
     if (notification.kind === 'trade.opened') return ` @ ${notification.trade.entryPrice}`;
     return ` pnl=${notification.trade.pnl.toFixed(2)} (${notification.trade.reason})`;
   }
