@@ -1,11 +1,14 @@
 import { Injectable, Optional } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import type { ConditionResult, DecisionOutcome, EvaluationSource } from './evaluation-snapshot.store';
 
 const ERROR_REEMIT_MS = 10 * 60_000;
 
+/** GET /bot/status `lastSignalBySymbol[symbol]`: built from the persisted evaluation_snapshots. */
 export interface SignalSnapshot {
   action: string;
   reason: string;
+  /** When the evaluation ran. */
   at: Date;
   /** Close time of the evaluated candle (ISO); absent when the strategy couldn't evaluate. */
   candleTime?: string;
@@ -13,6 +16,14 @@ export interface SignalSnapshot {
   price?: number;
   /** The strategy's own indicator snapshot (emaFast, emaSlow, rsi, atr, emaRegime). */
   indicators?: Record<string, number | undefined>;
+  /** Open time of the evaluated candle (ISO). */
+  candleOpenTime?: string;
+  source?: EvaluationSource;
+  /** Side whose entry rules the conditions refer to. */
+  side?: 'LONG' | 'SHORT';
+  /** The three entry conditions as the strategy judged them; absent with an open position. */
+  conditions?: ConditionResult[];
+  decision?: { outcome: DecisionOutcome; reason: string };
 }
 
 export interface CycleDetails {
@@ -25,13 +36,12 @@ export interface CycleDetails {
 /**
  * In-memory observability state for GET /bot/status and the periodic heartbeat log.
  * Never persisted and never consulted for trading decisions - purely "what is the bot doing
- * right now", so a restart losing this history is fine (bot_state/trades remain the source
- * of truth for anything that matters to risk/execution).
+ * right now", so a restart losing this history is fine. The per-symbol evaluation the dashboard
+ * explains lives in evaluation_snapshots instead, so it survives restarts.
  */
 @Injectable()
 export class RuntimeStatusService {
   private lastCycleAt?: Date;
-  private readonly lastSignalBySymbol = new Map<string, SignalSnapshot>();
   private lastError?: string;
   private lastErrorEmittedAt = 0;
   private lastPollAt?: Date;
@@ -63,7 +73,6 @@ export class RuntimeStatusService {
       ...(details.price !== undefined ? { price: details.price } : {}),
       ...(details.indicators ? { indicators: details.indicators } : {}),
     };
-    this.lastSignalBySymbol.set(symbol, { action, reason, at, ...extra });
     this.eventEmitter?.emit('bot.cycle', { symbol, action, reason, at: at.toISOString(), ...extra });
   }
 
@@ -82,10 +91,6 @@ export class RuntimeStatusService {
 
   getLastCycleAt(): Date | null {
     return this.lastCycleAt ?? null;
-  }
-
-  getLastSignalBySymbol(): Record<string, SignalSnapshot> {
-    return Object.fromEntries(this.lastSignalBySymbol);
   }
 
   getLastError(): string | null {
