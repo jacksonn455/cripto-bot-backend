@@ -1,0 +1,61 @@
+# External heartbeat watchdog, off the VM: if the whole Oracle VM is down, the PM2 watchdog on it
+# is down too. This reads the heartbeat the worker persists in MongoDB and sends one
+# "WORKER OFFLINE" (once per outage) to Discord. Read-only for trading: it never runs the strategy
+# and never touches orders/trades/positions — only the worker_heartbeat document (read) and the
+# shared WORKER_OFFLINE incident record (open/close).
+#
+# Optional second watchdog (the primary is krypto-watchdog under PM2 on the VM).
+# Secrets (Settings > Secrets and variables > Actions): MONGO_URI, DISCORD_WEBHOOK_URL.
+# GitHub schedules are best-effort (runs can be delayed a few minutes) and are paused after 60 days
+# without repository activity. Atlas must accept the runners' IPs (see docs/DEPLOY_ORACLE.md).
+name: heartbeat-watchdog
+
+on:
+  # Manual runs only for now. Re-enable the schedule ONLY after (1) the MONGO_URI and
+  # DISCORD_WEBHOOK_URL secrets are configured and (2) MongoDB Atlas Network Access accepts the
+  # GitHub runners (they have no fixed IP). Otherwise every run fails and fills the Actions log.
+  # schedule:
+  #   - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heartbeat-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build
+
+      - name: Check worker heartbeat
+        run: node dist/watchdog/heartbeat-watchdog.js
+        env:
+          NODE_ENV: production
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          DISCORD_ENABLED: 'true'
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_EVENTS: alerts,trades
+          DISCORD_ALERTS_ENABLED: 'true'
+          # Same values as the VM's .env (they only shape the check and the message).
+          TRADING_MODE: PAPER
+          EXECUTION_ENABLED: 'true'
+          WORKER_HEARTBEAT_TIMEOUT_SECONDS: '300'
+          KRYPTO_ENVIRONMENT: PRODUCTION
+          NOTIFICATIONS_TIME_ZONE: America/Sao_Paulo
+          TELEGRAM_ENABLED: 'false'

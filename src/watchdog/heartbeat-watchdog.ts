@@ -16,7 +16,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { TelegramNotificationProvider } from '../notifications/telegram/telegram-notification.provider';
 
 /**
- * External heartbeat watchdog — run as a separate, short-lived process (Render Cron Job, every
+ * External heartbeat watchdog — run as a separate, short-lived process (PM2 cron on the VM and a GitHub Actions schedule, every
  * few minutes). It exists because a dead or sleeping worker cannot report its own death: this
  * reads the heartbeat the worker persists and, if it is older than WORKER_HEARTBEAT_TIMEOUT_SECONDS,
  * opens the shared WORKER_OFFLINE incident and sends one "WORKER OFFLINE" message. It never runs
