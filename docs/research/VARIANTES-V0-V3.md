@@ -37,6 +37,7 @@ Os critérios não foram alterados depois. Os números completos estão em `vari
 | Win rate | 28,0% | 27,3% | 29,0% | 26,4% |
 | Profit factor | 0,91 | 0,71 | 0,79 | 0,71 |
 | Expectância (USDT por trade) | −2,61 | −7,49 | −5,56 | −6,47 |
+| R médio por trade | −0,03R | −0,21R | −0,18R | −0,17R |
 | Retorno | −6,2% | −18,4% | −14,4% | −42,5% |
 | Max drawdown (curva diária) | 22,0% | 27,7% | 23,4% | 50,4% |
 | Sharpe / Sortino anualizados | −0,25 / −0,45 | −1,11 / −1,93 | −0,80 / −1,43 | −1,58 / −2,56 |
@@ -110,7 +111,7 @@ seria exatamente o overfitting que o protocolo proíbe.
 | A4: ≥ 60% das janelas positivas | ✗ 3/7 | ✗ 0/7 | ✗ 0/7 | ✗ 0/7 |
 | A5: PF > 1 em ≥ 3 ativos | ✗ 1 | ✗ 0 | ✗ 0 | ✗ 0 |
 | B1: PF e expectância melhores que V0 em ≥ 60% das janelas | — | ✗ 43% | ✗ 57% | ✗ 14% |
-| B2: R médio ≥ o de V0 | — | (no próximo commit) | (no próximo commit) | (no próximo commit) |
+| B2: R médio ≥ o de V0 (−0,03R) | — | ✗ −0,21R | ✗ −0,18R | ✗ −0,17R |
 | B3: max drawdown ≤ 1,2× o de V0 | — | ✗ 27,7% vs 22,0% | ✓ 23,4% | ✗ 50,4% |
 | B4: PF com 2× ≥ o de V0 | — | ✗ | ✗ | ✗ |
 | B5: PBO < 0,5 | — | ✓ 0,07 | ✓ 0,07 | ✓ 0,07 |
@@ -119,9 +120,9 @@ seria exatamente o overfitting que o protocolo proíbe.
 Long + short reprova nos mesmos itens: PF fora da amostra de 0,70 a 0,91, DSR ≤ 0,03 e no máximo 2 de 7 janelas positivas.
 
 > Nota de medição: na primeira rodada, o R das variantes com trailing usava o stop final (que já tinha subido até perto
-> da entrada) em vez do stop inicial, e por isso saía entre −0,8 e −3,6. O motor foi corrigido: a trade agora grava o stop
-> com que a posição foi dimensionada. As simulações estão rodando de novo só para atualizar o R médio. Nenhum outro
-> número desta página depende disso.
+> da entrada) em vez do stop inicial, e saía entre −0,8 e −3,6. O motor foi corrigido (a trade grava o stop com que a posição
+> foi dimensionada) e as 208 simulações rodaram de novo. Só o R mudou; profit factor, trades, PnL, drawdown, DSR e PBO
+> ficaram idênticos. Em DEV, só long, custos 1×, o R médio é: V0 +0,08 · V1 −0,07 · V2 −0,11 · V3 −0,04.
 
 ## O que fazer
 
