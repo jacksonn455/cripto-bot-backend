@@ -3,7 +3,9 @@ import * as Joi from 'joi';
 /** Official webhook hosts (discordapp.com is the legacy one); optional /vN API version. */
 const DISCORD_WEBHOOK =
   /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+$/;
-const NOTIFICATION_EVENTS = /^\s*(alerts|trades)\s*(,\s*(alerts|trades)\s*)*$/i;
+const CORS_ORIGIN = String.raw`https?:\/\/[^\s,/*]+`;
+const CORS_ORIGIN_LIST = new RegExp(String.raw`^\s*${CORS_ORIGIN}\/?\s*(,\s*${CORS_ORIGIN}\/?\s*)*$`);
+const NOTIFICATION_EVENTS =/^\s*(alerts|trades)\s*(,\s*(alerts|trades)\s*)*$/i;
 
 // Fails fast on boot if required env vars are missing or LIVE mode is misconfigured.
 export const validationSchema = Joi.object({
@@ -11,14 +13,31 @@ export const validationSchema = Joi.object({
     .valid('development', 'test', 'production')
     .default('development'),
   PORT: Joi.number().port().default(8000),
-  HOST: Joi.string().ip().default('0.0.0.0'),
+  // Loopback by default: the API sits behind Nginx on the VM (Docker sets HOST=0.0.0.0).
+  HOST: Joi.string().ip().default('127.0.0.1'),
+  // Comma-separated browser origins allowed to call the API directly; empty = CORS off (the
+  // dashboard goes through its server-side proxy). Exact origins only: never "*".
+  CORS_ORIGINS: Joi.string().allow('').pattern(CORS_ORIGIN_LIST).default('').messages({
+    'string.pattern.base':
+      'CORS_ORIGINS must be a comma-separated list of origins like https://app.vercel.app,http://localhost:3000 ("*" is not allowed)',
+  }),
   LOG_LEVEL: Joi.string()
     .valid('fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent')
     .default('info'),
 
+  // Required in production: a missing URI must stop the boot, not silently use a local database.
   MONGO_URI: Joi.string()
     .uri({ scheme: ['mongodb', 'mongodb+srv'] })
-    .default('mongodb://localhost:27017/trade-bot'),
+    .when('NODE_ENV', {
+      is: 'production',
+      then: Joi.required(),
+      otherwise: Joi.optional().default('mongodb://localhost:27017/trade-bot'),
+    })
+    .messages({
+      'any.required': 'MONGO_URI is required when NODE_ENV=production',
+      'string.uri': 'MONGO_URI must be a mongodb:// or mongodb+srv:// URI',
+      'string.uriCustomScheme': 'MONGO_URI must be a mongodb:// or mongodb+srv:// URI',
+    }),
 
   TRADING_MODE: Joi.string().valid('PAPER', 'LIVE').default('PAPER'),
   // Second gate for LIVE mode: env alone can never accidentally enable real orders.
