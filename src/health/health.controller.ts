@@ -26,7 +26,7 @@ export class HealthController {
     const loop = this.worker.loopState();
     if (loop === 'stalled') {
       // The process answers but its loop stopped ticking: fail the host's health check so it
-      // restarts the instance (Render does), instead of leaving a zombie that trades nothing.
+      // restarts the instance (scripts/deploy.sh and external monitors check it), instead of leaving a zombie that trades nothing.
       res.status(HttpStatus.SERVICE_UNAVAILABLE);
     }
     return {

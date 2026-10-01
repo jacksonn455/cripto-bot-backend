@@ -1,14 +1,22 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
+import { parseCorsOrigins } from './config/cors.util';
 import { WorkerHeartbeatService } from './control/worker-heartbeat.service';
 import { sanitizeForAlert } from './incidents/incident-format.util';
 import { IncidentService } from './incidents/incident.service';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  // Behind Nginx: one trusted hop, so req.ip / protocol come from X-Forwarded-* (rate limiting, logs).
+  app.set('trust proxy', 1);
+  // The dashboard calls the API server-side (Vercel proxy), so CORS is off unless CORS_ORIGINS
+  // lists origins whose browsers call the API directly. Validated in validation.schema.ts (no "*" in production).
+  const corsOrigins = parseCorsOrigins(process.env.CORS_ORIGINS);
+  if (corsOrigins.length) app.enableCors({ origin: corsOrigins, credentials: false });
   app.useLogger(app.get(Logger));
   const logger = app.get(Logger);
 
@@ -61,10 +69,10 @@ async function bootstrap() {
     SwaggerModule.setup('docs', app, document);
   }
 
-  // Render injects PORT; 8000 is the local fallback.
   const port = Number(process.env.PORT) || 8000;
-  // 0.0.0.0 (default) = reachable from the network/Docker; 127.0.0.1 = only this machine.
-  const host = process.env.HOST || '0.0.0.0';
+  // 127.0.0.1 (default) = only this machine, behind the Nginx reverse proxy; 0.0.0.0 = reachable
+  // from the network (Docker sets it in the Dockerfile).
+  const host = process.env.HOST || '127.0.0.1';
   await app.listen(port, host);
   logger.log(`Server listening on ${host}:${port}`, 'Bootstrap');
 }

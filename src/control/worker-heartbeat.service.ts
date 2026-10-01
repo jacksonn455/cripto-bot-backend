@@ -16,7 +16,7 @@ import {
 /** Identifies this process in the heartbeat and in evaluation claims (two can overlap during a deploy). */
 export const WORKER_INSTANCE_ID = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
 
-/** Prefix of every worker lifecycle log line, so they can be grepped in the Render logs. */
+/** Prefix of every worker lifecycle log line, so they can be grepped in the logs (pm2 logs krypto-backend). */
 export const WORKER_LOG = '[KRYPTO_WORKER]';
 
 /** At most one "loop stalled" alert per this window, so a flapping loop doesn't flood Discord. */

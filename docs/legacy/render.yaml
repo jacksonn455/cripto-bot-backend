@@ -1,3 +1,7 @@
+# LEGACY (not used): the backend moved to an Oracle Cloud VM with PM2 — see docs/DEPLOY_ORACLE.md.
+# Kept only as a reference of the old Render setup. Do NOT re-sync this blueprint: it would start
+# a SECOND trading worker on the same database.
+
 # Render Blueprint for this repo (the dashboard is deployed separately, on Vercel). Secrets are `sync: false`:
 # Render asks for them on the first deploy (values in backend/.env.render, git-ignored).
 services:

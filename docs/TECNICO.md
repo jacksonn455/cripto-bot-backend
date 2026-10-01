@@ -162,7 +162,7 @@ gráficos a cada poucos segundos. `RedisCacheService` ([src/cache](../src/cache)
   uma dependência de corretude (mesma filosofia de fail-open usada com a Binance no resto do
   projeto).
 - **`REDIS_URL`**: em uso, Upstash via TLS (`rediss://default:<token>@<db>.upstash.io:6379`, o token
-  é o `UPSTASH_REDIS_REST_TOKEN`; no Render fica como secret). Local: `redis://localhost:6379`, ou `redis://redis:6379` dentro do Docker
+  é o `UPSTASH_REDIS_REST_TOKEN`; em produção fica só no `.env` da VM). Local: `redis://localhost:6379`, ou `redis://redis:6379` dentro do Docker
   Compose) e **`REPORTS_CACHE_TTL_SECONDS`** (padrão `30`) ficam no `.env`.
 
 ### Redis: onde é usado e o que acontece sem ele
@@ -191,7 +191,7 @@ Comportamento com o Redis fora do ar ou travado:
 - **Erros reais não são mascarados**: só erros do cache são engolidos. Se a query do Mongo (a `factory` do
   `getOrSet`) falhar, o erro propaga normalmente.
 - `REDIS_ENABLED=false` (ou `REDIS_URL=`) desliga o cache sem tentar conectar. O painel mostra
-  "desativado (opcional)" em vez de erro. Era essa a mensagem "indisponível" em produção no Render, onde o
+  "desativado (opcional)" em vez de erro. Era essa a mensagem "indisponível" na antiga produção no Render, onde o
   cache está desligado de propósito.
 
 ## Long e Short
@@ -245,7 +245,7 @@ Depois de `RISK_MAX_CONSECUTIVE_STOPS` (padrão 3) saídas por stop seguidas, o 
 - **Paper/Live:** a sequência é contada a partir das trades fechadas no Mongo **depois de `bot_state.stopStreakResetAt`**,
   que `POST /bot/resume` grava. Retomar o bot zera a sequência. Antes, o bot continuava vetando para sempre mesmo depois de
   retomado, porque os mesmos 3 stops continuavam sendo os mais recentes. O marco fica no Mongo, então um restart do
-  processo (deploy no Render) não zera nem desfaz nada. Posições abertas não são afetadas: a trava só bloqueia entradas.
+  processo (deploy ou restart do PM2) não zera nem desfaz nada. Posições abertas não são afetadas: a trava só bloqueia entradas.
 - **Backtest:** ninguém retoma uma simulação, então a pausa dura até o próximo dia UTC (`stopPauses` na execução). Antes ela
   nunca acabava: o backtest de BTCUSDT de 01/04 a 30/09/2026 parou de operar depois do 3º stop, em 20/04.
 - Depois do deploy, um bot que já estava travado continua travado até a primeira retomada manual (comportamento correto).
