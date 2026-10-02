@@ -59,8 +59,13 @@ describe('PaperExchangeGateway persistence', () => {
 });
 
 describe('PaperExchangeGateway short selling', () => {
-  it('advertises short support (simulated) unlike Binance Spot', () => {
-    expect(new PaperExchangeGateway(BINANCE, TRADING).supportsShortSelling).toBe(true);
+  it('mirrors Binance Spot by default: no short support, so risk vetoes shorts as in LIVE', () => {
+    expect(new PaperExchangeGateway(BINANCE, TRADING).supportsShortSelling).toBe(false);
+  });
+
+  it('advertises simulated short support only with PAPER_SIMULATED_SHORTS', () => {
+    const trading = { paperInitialBalanceAsset: 'USDT', paperInitialBalanceAmount: 10_000, paperSimulatedShorts: true } as never;
+    expect(new PaperExchangeGateway(BINANCE, trading).supportsShortSelling).toBe(true);
   });
 
   it('simulates a short as a negative base balance, and buying back settles the pnl in USDT', async () => {

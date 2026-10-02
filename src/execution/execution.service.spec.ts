@@ -3,6 +3,11 @@ import { TradesService } from '../trades/trades.service';
 import { Candle } from '../exchange/types/candle.type';
 import { InMemoryEvaluationCheckpointStore } from './evaluation-checkpoint.store';
 import { ExecutionService, MarketDataError } from './execution.service';
+import { CandidateRecorderService } from '../candidates/candidate-recorder.service';
+import { InMemoryCandidateLedgerStore } from '../candidates/candidate-ledger.store';
+import { BaselineJudge } from '../candidates/judge/baseline.judge';
+import { NoopJudge } from '../candidates/judge/noop.judge';
+import type { CandidateJudge } from '../candidates/judge/candidate-judge.interface';
 
 function candle(closeTime: number, close: number, high: number, low: number): Candle {
   return {
@@ -38,6 +43,11 @@ function makeDeps(overrides: {
   fillPrice?: number;
   checkpoints?: InMemoryEvaluationCheckpointStore;
   snapshots?: InMemoryEvaluationSnapshotStore;
+  recorder?: CandidateRecorderService;
+  botState?: { isPaused: boolean; pauseReason?: string };
+  /** Replaces the fixed risk decision (e.g. to answer the "as if resumed" re-evaluation differently). */
+  evaluateRisk?: (signal: unknown, ctx: { isPaused?: boolean; consecutiveStopLosses?: number }) => unknown;
+  riskContext?: Record<string, unknown>;
 } = {}) {
   const candles = overrides.candles ?? [candle(1_000, 100, 101, 99)];
   const signal = overrides.signal ?? {
@@ -72,8 +82,8 @@ function makeDeps(overrides: {
 
   const strategy = { name: 'TrendRegimeStrategy', onCandleClosed: jest.fn().mockReturnValue(signal) };
   const strategyRegistry = { get: jest.fn().mockReturnValue(strategy) };
-  const riskManager = { evaluate: jest.fn().mockReturnValue(decision) };
-  const riskContextBuilder = { build: jest.fn().mockResolvedValue({}) };
+  const riskManager = { evaluate: overrides.evaluateRisk ? jest.fn(overrides.evaluateRisk) : jest.fn().mockReturnValue(decision) };
+  const riskContextBuilder = { build: jest.fn().mockResolvedValue(overrides.riskContext ?? {}) };
   const signalsService = { record: jest.fn().mockResolvedValue(undefined) };
   const tradesService = {
     findOpenPosition: jest.fn().mockResolvedValue(overrides.openTrade ?? null),
@@ -89,7 +99,10 @@ function makeDeps(overrides: {
     findByTradeId: jest.fn().mockResolvedValue([]),
   };
   const reconciliation = { isOk: jest.fn().mockReturnValue(true) };
-  const controlService = { checkAutoPauseConditions: jest.fn().mockResolvedValue(undefined) };
+  const controlService = {
+    checkAutoPauseConditions: jest.fn().mockResolvedValue(undefined),
+    getState: jest.fn().mockResolvedValue(overrides.botState ?? { isPaused: false }),
+  };
   const runtimeStatus = {
     recordCycle: jest.fn(),
     recordError: jest.fn(),
@@ -118,6 +131,7 @@ function makeDeps(overrides: {
     riskConfigValues as never,
     checkpoints,
     snapshots,
+    overrides.recorder,
   );
 
   return {
@@ -691,5 +705,141 @@ describe('ExecutionService - persisted evaluation snapshots (dashboard after a r
 
     await expect(run(deps)).resolves.toMatchObject({ status: 'evaluated' });
     expect(deps.gateway.placeOrder).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ExecutionService candidate ledger', () => {
+  const gates = (fail?: string) =>
+    (['SIDE', 'REGIME', 'RSI', 'INDICATORS'] as const).map((gate) => ({ gate, ok: gate !== fail }));
+  const entrySignal = {
+    action: 'ENTER_LONG',
+    symbol: 'BTCUSDT',
+    strategy: 'TrendRegimeStrategy',
+    candleTime: 1_000,
+    price: 100,
+    stopLoss: 90,
+    indicators: {},
+    reason: 'test',
+    candidates: [{ setupType: 'EMA_CROSS', side: 'LONG', gates: gates(), accepted: true, price: 100, stopLoss: 90 }],
+  };
+  const rejectedSignal = {
+    action: 'NONE',
+    symbol: 'BTCUSDT',
+    strategy: 'TrendRegimeStrategy',
+    candleTime: 1_000,
+    price: 100,
+    indicators: {},
+    reason: 'regime nao esta em alta',
+    candidates: [{ setupType: 'EMA_CROSS', side: 'LONG', gates: gates('REGIME'), accepted: false, price: 100, stopLoss: 90 }],
+  };
+  afterEach(() => jest.useRealTimers());
+
+  const recorder = (judgeMode: 'off' | 'shadow' = 'off', judge: CandidateJudge = new NoopJudge(), store = new InMemoryCandidateLedgerStore()) => ({
+    store,
+    recorder: new CandidateRecorderService(
+      { ledgerEnabled: true, judgeMode, judge: 'noop', judgeTimeoutMs: 1000, shadowRefreshMinutes: 0 } as never,
+      store,
+      judge,
+    ),
+  });
+
+  it('persists an accepted candidate with its risk decision and final action', async () => {
+    const { store, recorder: r } = recorder();
+    const { service, gateway } = makeDeps({ signal: entrySignal, recorder: r });
+    await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
+    expect([...store.rows.values()]).toEqual([
+      expect.objectContaining({
+        candidateId: 'PAPER:BTCUSDT:1h:1000:EMA_CROSS:LONG',
+        strategyDecision: 'ACCEPTED',
+        risk: { approved: true, qty: 1 },
+        botPaused: false,
+        rejectedAt: null,
+        finalAction: 'ENTERED',
+      }),
+    ]);
+  });
+
+  it('persists candidates the strategy rejected (no risk evaluation, no order)', async () => {
+    const { store, recorder: r } = recorder();
+    const { service, gateway, riskManager } = makeDeps({ signal: rejectedSignal, recorder: r });
+    await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+    expect(riskManager.evaluate).not.toHaveBeenCalled();
+    expect([...store.rows.values()]).toEqual([
+      expect.objectContaining({ strategyDecision: 'REJECTED', strategyRejectedAt: 'REGIME', rejectedAt: 'REGIME', finalAction: 'REJECTED' }),
+    ]);
+  });
+
+  it('a paused bot records the candidate as blocked by the pause, with the as-if-resumed answer, and trades nothing', async () => {
+    const { store, recorder: r } = recorder();
+    const { service, gateway, tradesService, riskManager } = makeDeps({
+      signal: entrySignal,
+      recorder: r,
+      botState: { isPaused: true, pauseReason: 'CONSECUTIVE_STOPS_LIMIT' },
+      riskContext: { isPaused: true, consecutiveStopLosses: 3 },
+      // The real RiskManager order: the pause first, then the stop streak.
+      evaluateRisk: (_s, ctx) =>
+        ctx.isPaused
+          ? { approved: false, rejectReason: 'BOT_PAUSED' }
+          : (ctx.consecutiveStopLosses ?? 0) >= 3
+            ? { approved: false, rejectReason: 'CONSECUTIVE_STOPS_LIMIT' }
+            : { approved: true, qty: 1 },
+    });
+    await service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+
+    expect(gateway.placeOrder).not.toHaveBeenCalled();
+    expect(tradesService.openPosition).not.toHaveBeenCalled();
+    // The counterfactual re-run is the second, read-only call: pause off, streak restarted.
+    expect(riskManager.evaluate).toHaveBeenLastCalledWith(entrySignal, expect.objectContaining({ isPaused: false, consecutiveStopLosses: 0 }));
+    expect([...store.rows.values()]).toEqual([
+      expect.objectContaining({
+        botPaused: true,
+        pauseReason: 'CONSECUTIVE_STOPS_LIMIT',
+        risk: { approved: false, rejectReason: 'BOT_PAUSED' },
+        riskIfResumed: { approved: true },
+        rejectedAt: 'PAUSE',
+        finalAction: 'REJECTED',
+      }),
+    ]);
+  });
+
+  it('a ledger failure never affects the cycle', async () => {
+    const failing = Object.assign(new InMemoryCandidateLedgerStore(), { upsertMany: () => Promise.reject(new Error('mongo down')) });
+    const { recorder: r } = recorder('off', new NoopJudge(), failing);
+    const { service, gateway } = makeDeps({ signal: entrySignal, recorder: r });
+    await expect(service.runCycle('BTCUSDT', 'TrendRegimeStrategy')).resolves.toMatchObject({ status: 'evaluated' });
+    expect(gateway.placeOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['ledger on, judge off', () => recorder('off').recorder],
+    ['shadow NoopJudge', () => recorder('shadow', new NoopJudge()).recorder],
+    ['shadow BaselineJudge', () => recorder('shadow', new BaselineJudge()).recorder],
+  ])('%s: zero behavioral change vs no ledger at all (orders, trades, risk, snapshot)', async (_name, make) => {
+    // Orders carry wall-clock timestamps: freeze the clock so both runs can be compared field by field.
+    jest.useFakeTimers({ now: new Date('2026-10-01T12:00:00Z'), doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    for (const signal of [entrySignal, rejectedSignal]) {
+      const plain = makeDeps({ signal });
+      const withLedger = makeDeps({ signal, recorder: make() });
+      const a = await plain.service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+      const b = await withLedger.service.runCycle('BTCUSDT', 'TrendRegimeStrategy');
+      expect(b).toEqual(a);
+      for (const key of ['gateway', 'tradesService', 'signalsService', 'ordersService'] as const) {
+        const before = plain[key] as unknown as Record<string, jest.Mock>;
+        const after = withLedger[key] as unknown as Record<string, jest.Mock>;
+        for (const fn of Object.keys(before).filter((k) => jest.isMockFunction(before[k]))) {
+          expect(after[fn].mock.calls).toEqual(before[fn].mock.calls);
+        }
+      }
+      expect(withLedger.riskManager.evaluate.mock.calls).toEqual(plain.riskManager.evaluate.mock.calls);
+      const snap = async (d: typeof plain) => {
+        const stored = await d.snapshots.get('PAPER', 'BTCUSDT');
+        return { ...stored!.snapshot!, evaluatedAt: undefined };
+      };
+      expect(await snap(withLedger)).toEqual(await snap(plain));
+    }
   });
 });

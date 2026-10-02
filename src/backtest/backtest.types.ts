@@ -1,3 +1,4 @@
+import type { CandidateRecord } from '../candidates/candidate.types';
 import type { Candle } from '../exchange/types/candle.type';
 import type { TradeExitReason, TradeSide } from '../trades/schemas/trade.schema';
 
@@ -45,6 +46,12 @@ export interface BacktestParams {
    * traded or recorded, like the history the live loop already has when it starts.
    */
   tradeFrom?: number;
+  /**
+   * Also return a candidate-ledger row for every setup that triggered (accepted or rejected, with
+   * its gates, features and risk decision). Observability only: the simulation never reads it, so
+   * trades, signals and equity are identical either way.
+   */
+  recordCandidates?: boolean;
 }
 
 /** One funding settlement of a perpetual (fraction of the notional; positive = longs pay shorts). */
@@ -115,4 +122,6 @@ export interface BacktestResult {
   finalBalance: number;
   /** Times the consecutive-stops pause was lifted at the next UTC day (see BacktestRunner). */
   stopPauses: number;
+  /** Only with params.recordCandidates. */
+  candidates?: CandidateRecord[];
 }

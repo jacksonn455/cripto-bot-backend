@@ -1,4 +1,5 @@
 import { registerAs } from '@nestjs/config';
+import type { JudgeKind, JudgeMode } from '../candidates/judge/candidate-judge.interface';
 
 export const appConfig = registerAs('app', () => ({
   nodeEnv: process.env.NODE_ENV ?? 'development',
@@ -19,6 +20,10 @@ export const tradingConfig = registerAs('trading', () => ({
   paperInitialBalanceAmount: parseFloat(
     process.env.PAPER_INITIAL_BALANCE_AMOUNT ?? '10000',
   ),
+  // PAPER mirrors the LIVE venue (Binance Spot can't short): shorts are vetoed with
+  // SHORT_NOT_SUPPORTED in both. true = PAPER simulates shorts anyway (a research setting: those
+  // trades could never happen in LIVE). Backtests always can short; that is the allowShort knob.
+  paperSimulatedShorts: process.env.PAPER_SIMULATED_SHORTS === 'true',
 }));
 
 export const binanceConfig = registerAs('binance', () => ({
@@ -183,4 +188,20 @@ export const openAiConfig = registerAs('openai', () => ({
   maxConcurrentRuns: parseInt(process.env.OPENAI_MAX_CONCURRENT_RUNS ?? '2', 10),
   // Off by default: traces would send prompts and tool outputs (trades, balances) to OpenAI's dashboard.
   tracingEnabled: process.env.OPENAI_TRACING_ENABLED === 'true',
+}));
+
+export const candidatesConfig = registerAs('candidates', () => ({
+  // Candidate ledger (candidate_assessments): every triggered entry setup, accepted or rejected, with
+  // its gates, features and risk/pause outcome. Observability only — trading never reads it.
+  ledgerEnabled: process.env.CANDIDATE_LEDGER_ENABLED !== 'false',
+  // How often the worker fills in shadow outcomes (what a candidate would have done if traded).
+  // 0 = never automatically (POST /candidates/shadow/refresh still works).
+  shadowRefreshMinutes: parseInt(process.env.CANDIDATE_SHADOW_REFRESH_MINUTES ?? '60', 10),
+  // off = no judge runs (default). shadow = the judge's assessment is stored on each candidate and
+  // NEVER read for trading. There is no mode in which a judge can change a decision yet.
+  judgeMode: (process.env.AI_JUDGE_MODE ?? 'off') as JudgeMode,
+  // Which judge runs in shadow mode: noop (no opinion) or baseline (the deterministic rules). No LLM.
+  judge: (process.env.AI_JUDGE ?? 'noop') as JudgeKind,
+  // Per assessment; a slow judge only loses its own assessment, never delays a decision (it runs after it).
+  judgeTimeoutMs: parseInt(process.env.AI_JUDGE_TIMEOUT_MS ?? '5000', 10),
 }));

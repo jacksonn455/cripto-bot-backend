@@ -196,4 +196,15 @@ export class RunBacktestDto {
   @IsOptional()
   @IsObject()
   strategyParams?: Record<string, unknown>;
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Also store the candidate ledger of the run (GET /candidates?runId=…, GET /candidates/funnel?runId=…): every ' +
+      'triggered setup, accepted or rejected, with its gates, features, risk decision and shadow outcome. ' +
+      'Observability only: trades and metrics are identical with or without it, and it is not part of the params hash.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  recordCandidates?: boolean;
 }

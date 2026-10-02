@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { riskConfig, trendRegimeConfig } from '../config/configuration';
 import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
+import { CANDIDATE_LEDGER_STORE, type CandidateLedgerStore } from '../candidates/candidate-ledger.store';
+import type { CandidateRecord } from '../candidates/candidate.types';
+import { simulateShadowOutcome } from '../candidates/shadow-outcome';
 import { FundingHistoryService } from '../funding/funding-history.service';
 import { HistoricalCandlesService } from '../market-data/historical-candles.service';
 import { intervalToMs } from '../market-data/interval.util';
@@ -22,6 +25,7 @@ import { EquitySnapshotsService } from '../reports/equity-snapshots.service';
 import { RiskManagerService } from '../risk/risk-manager.service';
 import { SignalsService } from '../risk/signals.service';
 import { StrategyRegistryService } from '../strategy/strategy-registry.service';
+import { strategyWindowSize } from '../strategy/strategy-window';
 import { effectiveStrategyParams, StrategyParamsError, type Strategy } from '../strategy/strategy.interface';
 import { TradesService } from '../trades/trades.service';
 import {
@@ -63,6 +67,8 @@ export interface BacktestRunResponse {
   engineVersion: number;
   paramVariationsTestedForStrategy: number;
   walkForwardWindows?: WalkForwardWindowResult[];
+  /** Candidate-ledger rows stored for this run (only with recordCandidates: true). */
+  candidatesRecorded?: number;
 }
 
 /**
@@ -102,8 +108,6 @@ export type BacktestRunWithVariations = BacktestRun & {
  */
 export const BACKTEST_ENGINE_VERSION = 2;
 
-/** Extra candles the live loop fetches beyond the regime EMA period (see ExecutionService.runCycle). */
-const LIVE_LOOKBACK_MARGIN = 10;
 const MAX_SYMBOLS = 10;
 export const MAX_PBO_RUNS = 20;
 
@@ -129,6 +133,7 @@ export class BacktestService {
     @Inject(trendRegimeConfig.KEY) private readonly trendRegime: ReturnType<typeof trendRegimeConfig>,
     @Inject(riskConfig.KEY) private readonly risk: ReturnType<typeof riskConfig>,
     private readonly eventEmitter: EventEmitter2,
+    @Optional() @Inject(CANDIDATE_LEDGER_STORE) private readonly candidateLedger?: CandidateLedgerStore,
   ) {}
 
   /**
@@ -160,7 +165,8 @@ export class BacktestService {
     const shortsOn = strategyParams.allowShort === 1;
     const regimeTimeframe = dto.regimeTimeframe ?? this.trendRegime.regimeTimeframe;
     const separateRegime = regimeTimeframe !== dto.timeframe;
-    const lookback = (strategyParams.emaRegime ?? this.trendRegime.emaRegime) + LIVE_LOOKBACK_MARGIN;
+    // The same window the live loop evaluates on (strategy-window.ts).
+    const lookback = strategyWindowSize(strategyParams.emaRegime ?? this.trendRegime.emaRegime);
     const allocation = dto.initialBalance / symbols.length;
     // Equal to slippagePct behaves exactly like omitting it, so it isn't a new variation either.
     const stopSlippagePct =
@@ -193,6 +199,7 @@ export class BacktestService {
     const curves = new Map<string, EquityPoint[]>(books.map((b) => [b, []]));
     const allTrades: SimulatedTrade[] = [];
     let stopPauses = 0;
+    let candidatesRecorded = 0;
     // First/last traded-period prices per symbol, for the buy-and-hold comparison.
     const prices = new Map<string, { start?: number; end?: number }>(symbols.map((s) => [s, {}]));
     const walkForwardWindows: WalkForwardWindowResult[] = [];
@@ -218,9 +225,13 @@ export class BacktestService {
           initialBalance: balances.get(book)!,
           symbolFilters: group[0].symbolFilters,
           tradeFrom: window.from,
+          recordCandidates: dto.recordCandidates === true,
         };
         const result = new BacktestRunner(strategy, this.riskManager, params).runPortfolio(group);
         await this.persistTradesAndSignals(result, runId, dto.strategy, dto.timeframe);
+        if (result.candidates) {
+          candidatesRecorded += await this.persistCandidates(result.candidates, group, strategy, runId, dto, lookback);
+        }
         balances.set(book, result.finalBalance);
         curves.get(book)!.push(...result.equityCurve);
         windowTrades.push(...result.trades);
@@ -342,6 +353,7 @@ export class BacktestService {
       engineVersion: BACKTEST_ENGINE_VERSION,
       paramVariationsTestedForStrategy,
       walkForwardWindows: dto.walkForward ? walkForwardWindows : undefined,
+      ...(dto.recordCandidates ? { candidatesRecorded } : {}),
     };
   }
 
@@ -544,6 +556,52 @@ export class BacktestService {
       })),
     );
     await this.signalsService.insertMany(result.signals, strategy, 'BACKTEST', runId);
+  }
+
+  /**
+   * Candidate ledger of one simulated group, with each candidate's shadow outcome computed from the
+   * candles already loaded for it (same strategy instance, windows and costs as the run). Runs after
+   * the simulation, so it can't affect it.
+   */
+  private async persistCandidates(
+    records: CandidateRecord[],
+    series: SymbolSeries[],
+    strategy: Strategy,
+    runId: string,
+    dto: RunBacktestDto,
+    lookback: number,
+  ): Promise<number> {
+    if (!this.candidateLedger || records.length === 0) return 0;
+    const bySymbol = new Map(series.map((s) => [s.symbol, s]));
+    const costs = {
+      feesPct: dto.feesPct,
+      slippagePct: dto.slippagePct,
+      stopSlippagePct: dto.stopSlippagePct ?? dto.slippagePct,
+      shortBorrowPctPerDay: dto.shortBorrowPctPerDay ?? 0,
+    };
+    const computedAt = new Date();
+    const rows = records.map((r) => {
+      const s = bySymbol.get(r.symbol);
+      const outcome =
+        s && r.stopLoss !== undefined
+          ? simulateShadowOutcome({
+              strategy,
+              symbol: r.symbol,
+              side: r.side,
+              price: r.price,
+              stopLoss: r.stopLoss,
+              candleCloseTime: r.candleCloseTime,
+              candles: s.candles.filter((c) => c.isClosed),
+              regimeCandles: s.regimeCandles?.filter((c) => c.isClosed),
+              windowSize: lookback,
+              regimeWindowSize: dto.regimeLookback ?? lookback,
+              costs,
+            })
+          : null;
+      return { ...r, runId, ...(outcome ? { shadow: { ...outcome, computedAt } } : {}) };
+    });
+    await this.candidateLedger.upsertMany(rows);
+    return rows.length;
   }
 
   private async persistEquity(curve: EquityPoint[], runId: string): Promise<void> {

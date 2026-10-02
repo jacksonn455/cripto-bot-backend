@@ -16,13 +16,16 @@ import type { PaperBalanceStore } from './paper-balance.store';
  * (tests) they live in memory only.
  * Order fill simulation here is intentionally simple (instant fill at last close for
  * MARKET orders); the backtest/execution phases will refine slippage and resting orders.
- * Shorts are simulated as a plain negative base balance (sell first, buy back later): no borrow
- * interest, funding or liquidation is modeled, so paper shorts look slightly better than real ones.
+ * Shorts: like the LIVE venue (Binance Spot), PAPER can't short by default, so RiskManager vetoes
+ * short entries with SHORT_NOT_SUPPORTED exactly as it does in LIVE — PAPER never simulates a trade
+ * LIVE would reject. PAPER_SIMULATED_SHORTS=true simulates them anyway, as a plain negative base
+ * balance (sell first, buy back later): no borrow interest, funding or liquidation is modeled, so
+ * paper shorts look slightly better than real ones.
  */
 @Injectable()
 export class PaperExchangeGateway implements ExchangeGateway {
   readonly kind: ExchangeGatewayKind = 'PAPER';
-  readonly supportsShortSelling = true;
+  readonly supportsShortSelling: boolean;
 
   private readonly logger = new Logger(PaperExchangeGateway.name);
   private readonly marketDataClient: BinanceRestClient;
@@ -38,6 +41,7 @@ export class PaperExchangeGateway implements ExchangeGateway {
     trading: ReturnType<typeof tradingConfig>,
     private readonly store?: PaperBalanceStore,
   ) {
+    this.supportsShortSelling = trading.paperSimulatedShorts === true;
     // No API key/secret needed: only public endpoints are used for market data.
     this.marketDataClient = new BinanceRestClient(
       '',

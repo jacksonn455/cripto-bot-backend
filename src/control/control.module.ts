@@ -10,6 +10,7 @@ import { ControlService } from './control.service';
 import { EVALUATION_SNAPSHOT_STORE, MongoEvaluationSnapshotStore } from './evaluation-snapshot.store';
 import { RuntimeStatusService } from './runtime-status.service';
 import { BotState, BotStateSchema } from './schemas/bot-state.schema';
+import { PauseEpisode, PauseEpisodeSchema } from './schemas/pause-episode.schema';
 import {
   EvaluationSnapshotDocument,
   EvaluationSnapshotRecord,
@@ -24,6 +25,7 @@ import { WorkerHeartbeatService } from './worker-heartbeat.service';
       { name: BotState.name, schema: BotStateSchema },
       { name: WorkerHeartbeat.name, schema: WorkerHeartbeatSchema },
       { name: EvaluationSnapshotRecord.name, schema: EvaluationSnapshotSchema },
+      { name: PauseEpisode.name, schema: PauseEpisodeSchema },
     ]),
     ExchangeModule,
     TradesModule,

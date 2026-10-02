@@ -13,6 +13,8 @@ import { EVALUATION_SNAPSHOT_STORE, InMemoryEvaluationSnapshotStore } from './ev
 import type { EvaluationSnapshot, EvaluationSnapshotStore } from './evaluation-snapshot.store';
 import { RuntimeStatusService, SignalSnapshot } from './runtime-status.service';
 import { BotState, BotStateDocument } from './schemas/bot-state.schema';
+import { PauseEpisode, PauseEpisodeDocument } from './schemas/pause-episode.schema';
+import { formatDuration } from './duration.util';
 import { WorkerHeartbeatService, WorkerStatus } from './worker-heartbeat.service';
 
 const QUOTE_ASSET = 'USDT'; // v1: all configured pairs are USDT-quoted (BTCUSDT, ETHUSDT).
@@ -34,6 +36,9 @@ export interface BotStatus {
   mode: string;
   paused: boolean;
   pauseReason?: string;
+  /** While paused: when the pause started and how long it has lasted (until POST /bot/resume). */
+  pausedAt?: Date;
+  pausedForMs?: number;
   lastReconciliationAt?: Date;
   lastReconciliationOk: boolean;
   /** Last time a new closed candle was evaluated (moves once per strategy timeframe). */
@@ -72,6 +77,9 @@ export class ControlService {
     @Optional()
     @Inject(EVALUATION_SNAPSHOT_STORE)
     private readonly snapshots: EvaluationSnapshotStore = new InMemoryEvaluationSnapshotStore(),
+    @Optional()
+    @InjectModel(PauseEpisode.name)
+    private readonly pauseEpisodes?: Model<PauseEpisodeDocument>,
   ) {}
 
   async getState(): Promise<BotState> {
@@ -112,6 +120,9 @@ export class ControlService {
       paused: state.isPaused,
       // Only meaningful while paused (docs from before the resume fix may carry a stale reason).
       pauseReason: state.isPaused ? state.pauseReason : undefined,
+      ...(state.isPaused && state.pausedAt
+        ? { pausedAt: state.pausedAt, pausedForMs: Date.now() - new Date(state.pausedAt).getTime() }
+        : {}),
       lastReconciliationAt: state.lastReconciliationAt,
       lastReconciliationOk: state.lastReconciliationOk,
       lastCycleAt,
@@ -134,26 +145,91 @@ export class ControlService {
   }
 
   async pause(reason: string): Promise<void> {
+    const state = await this.getOrCreateState();
+    const now = new Date();
+    const alreadyPaused = state.isPaused;
+    // A pause while paused keeps the original start: the episode lasts until the next resume.
+    const pausedAt = alreadyPaused && state.pausedAt ? state.pausedAt : now;
     await this.stateModel.updateOne(
       {},
-      { $set: { isPaused: true, pauseReason: reason, updatedAt: new Date() } },
+      { $set: { isPaused: true, pauseReason: reason, pausedAt, updatedAt: now } },
       { upsert: true },
     );
-    this.logger.warn(`Bot paused: ${reason}`);
-    this.eventEmitter.emit('bot.paused', { reason });
+    await this.recordPauseEpisode(alreadyPaused, reason, now);
+    this.logger.warn(
+      `Bot paused: ${reason}` +
+        (alreadyPaused ? ` (already paused since ${new Date(pausedAt).toISOString()})` : ` at ${now.toISOString()}`) +
+        ' - new entries blocked until POST /bot/resume',
+    );
+    this.eventEmitter.emit('bot.paused', { reason, pausedAt: new Date(pausedAt).toISOString() });
   }
 
   async resume(): Promise<void> {
+    const state = await this.getOrCreateState();
     const now = new Date();
     await this.stateModel.updateOne(
       {},
       // $set with undefined is dropped by Mongoose, so the old reason must be removed explicitly.
       // A resume also starts the consecutive-stop streak over (see BotState.stopStreakResetAt).
-      { $set: { isPaused: false, stopStreakResetAt: now, updatedAt: now }, $unset: { pauseReason: 1 } },
+      { $set: { isPaused: false, stopStreakResetAt: now, updatedAt: now }, $unset: { pauseReason: 1, pausedAt: 1 } },
       { upsert: true },
     );
-    this.logger.log('Bot resumed');
-    this.eventEmitter.emit('bot.resumed', {});
+    const pausedForMs = state.isPaused && state.pausedAt ? now.getTime() - new Date(state.pausedAt).getTime() : undefined;
+    if (state.isPaused) await this.closePauseEpisode(now, pausedForMs);
+    this.logger.log(
+      state.isPaused
+        ? `Bot resumed after ${pausedForMs !== undefined ? formatDuration(pausedForMs) : 'an unknown time'} ` +
+            `(pause reason: ${state.pauseReason ?? 'unknown'})`
+        : 'Bot resumed (was not paused)',
+    );
+    this.eventEmitter.emit(
+      'bot.resumed',
+      state.isPaused
+        ? {
+            pauseReason: state.pauseReason ?? null,
+            pausedAt: state.pausedAt ? new Date(state.pausedAt).toISOString() : null,
+            pausedForMs: pausedForMs ?? null,
+          }
+        : {},
+    );
+  }
+
+  /** Newest first. */
+  async listPauseEpisodes(limit = 20): Promise<PauseEpisode[]> {
+    if (!this.pauseEpisodes) return [];
+    return this.pauseEpisodes.find({}).sort({ pausedAt: -1 }).limit(limit).lean();
+  }
+
+  /** Observability only: a failed write is logged, the pause itself already happened. */
+  private async recordPauseEpisode(alreadyPaused: boolean, reason: string, at: Date): Promise<void> {
+    if (!this.pauseEpisodes) return;
+    try {
+      const open = alreadyPaused
+        ? await this.pauseEpisodes.findOne({ resumedAt: { $exists: false } }).sort({ pausedAt: -1 })
+        : null;
+      if (open) {
+        await this.pauseEpisodes.updateOne({ _id: open._id }, { $push: { additionalReasons: { reason, at } } });
+      } else {
+        await this.pauseEpisodes.create({ pausedAt: at, reason, mode: this.trading.mode, additionalReasons: [] });
+      }
+    } catch (err) {
+      this.logger.warn(`Could not record the pause episode: ${(err as Error).message}`);
+    }
+  }
+
+  private async closePauseEpisode(at: Date, durationMs: number | undefined): Promise<void> {
+    if (!this.pauseEpisodes) return;
+    try {
+      const open = await this.pauseEpisodes.findOne({ resumedAt: { $exists: false } }).sort({ pausedAt: -1 });
+      if (open) {
+        await this.pauseEpisodes.updateOne(
+          { _id: open._id },
+          { $set: { resumedAt: at, durationMs: durationMs ?? at.getTime() - new Date(open.pausedAt).getTime() } },
+        );
+      }
+    } catch (err) {
+      this.logger.warn(`Could not close the pause episode: ${(err as Error).message}`);
+    }
   }
 
   async recordReconciliation(ok: boolean): Promise<void> {

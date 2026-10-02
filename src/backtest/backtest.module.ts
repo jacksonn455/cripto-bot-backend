@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { CandidatesModule } from '../candidates/candidates.module';
 import { ExchangeModule } from '../exchange/exchange.module';
 import { FundingModule } from '../funding/funding.module';
 import { MarketDataModule } from '../market-data/market-data.module';
@@ -21,6 +22,7 @@ import { BacktestRun, BacktestRunSchema } from './schemas/backtest-run.schema';
     ReportsModule,
     ExchangeModule,
     FundingModule,
+    CandidatesModule,
   ],
   controllers: [BacktestController],
   providers: [BacktestService],

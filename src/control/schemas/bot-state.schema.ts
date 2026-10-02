@@ -12,6 +12,10 @@ export class BotState {
   @Prop()
   pauseReason?: string;
 
+  /** When the current pause started (kept by further pauses while paused; cleared by resume). */
+  @Prop()
+  pausedAt?: Date;
+
   @Prop()
   lastReconciliationAt?: Date;
 
