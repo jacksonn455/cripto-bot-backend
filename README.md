@@ -233,7 +233,3 @@ That starts Krypto in `PAPER` mode (the default), with simulated money and real 
 everything else (other commands, endpoints, architecture, technical decisions) see
 [docs/TECNICO.md](docs/TECNICO.md). Production runs on an Oracle Cloud VM with PM2:
 [docs/DEPLOY_ORACLE.md](docs/DEPLOY_ORACLE.md) (in Portuguese).
-
----
-
-Nest (the framework underneath) is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
