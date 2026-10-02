@@ -40,6 +40,34 @@ export interface Signal {
    * trading). Absent with an open position, where the strategy evaluates exits instead.
    */
   conditions?: EntryConditions;
+  /**
+   * Every entry setup whose trigger fired on this candle (accepted or not), with the result of each
+   * gate the strategy applied to it. Observability only — never read for trading; it feeds the
+   * candidate ledger. Absent with an open position.
+   */
+  candidates?: EntryCandidate[];
+}
+
+/** What triggers an entry setup: a fresh EMA fast/slow cross, or a pullback resumption (V3). */
+export type SetupType = 'EMA_CROSS' | 'PULLBACK';
+
+/**
+ * The rules a triggered setup must pass, in the order the funnel reports them. SIDE = shorts are
+ * enabled (always ok for longs); INDICATORS = ATR available to place the stop.
+ */
+export type CandidateGate = 'SIDE' | 'REGIME' | 'RSI' | 'ADX' | 'INDICATORS';
+
+export interface EntryCandidate {
+  setupType: SetupType;
+  side: 'LONG' | 'SHORT';
+  /** Every gate, in order, evaluated in full (no short-circuit) so "what else would have failed" is known. */
+  gates: Array<{ gate: CandidateGate; ok: boolean }>;
+  /** All gates passed: this is the entry the strategy emitted. */
+  accepted: boolean;
+  /** Close of the candle: the price the entry is (or would have been) sized at. */
+  price: number;
+  /** The stop the strategy uses (accepted) or would have used (rejected); absent without ATR. */
+  stopLoss?: number;
 }
 
 /** The three entry rules of one side, with the values the strategy compared. */

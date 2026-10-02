@@ -3,9 +3,11 @@ import { trendRegimeConfig } from '../config/configuration';
 import { Candle } from '../exchange/types/candle.type';
 import { IndicatorsService } from '../indicators/indicators.service';
 import {
+  EntryCandidate,
   EntryConditions,
   mergeStrategyParams,
   OpenPositionInfo,
+  SetupType,
   Signal,
   Strategy,
   StrategyContext,
@@ -218,6 +220,28 @@ export class TrendRegimeStrategy implements Strategy {
       rsi: { ok: rsiOk, value: rsiValue, min: this.config.rsiMin, max: this.config.rsiMax },
     };
 
+    const [shortRsiMin, shortRsiMax] = this.shortRsiBand();
+    const crossedDown = this.crossedBelow(emaFast, emaSlow, i);
+    const shortRsiOk = rsiValue !== undefined && rsiValue >= shortRsiMin && rsiValue <= shortRsiMax;
+    const shortConditions: EntryConditions = {
+      side: 'SHORT',
+      cross: { ok: crossedDown, emaFast: emaFast[i], emaSlow: emaSlow[i] },
+      regime: { ok: regimeIsDown, close: lastRegimeClose, ema: lastEmaRegime, bandPct: band },
+      rsi: { ok: shortRsiOk, value: rsiValue, min: shortRsiMin, max: shortRsiMax },
+    };
+
+    // Observability only (candidate ledger): every triggered setup with all its gates. The entry
+    // decisions below don't read it; a test pins that `accepted` always matches the emitted entry.
+    const candidates: EntryCandidate[] = [];
+    const judge = (setupType: SetupType, side: 'LONG' | 'SHORT', regimeOk: boolean, sideRsiOk: boolean) =>
+      candidates.push(this.candidate(setupType, side, last.close, atrValue, regimeOk, sideRsiOk, adxOk));
+    if (crossedUp) judge('EMA_CROSS', 'LONG', regimeIsUp, rsiOk);
+    if (crossedDown) judge('EMA_CROSS', 'SHORT', regimeIsDown, shortRsiOk);
+    if (this.pullbackLookback > 0) {
+      if (this.pullbackResumed('LONG', candles, emaFast, emaSlow, i)) judge('PULLBACK', 'LONG', regimeIsUp, rsiOk);
+      if (this.pullbackResumed('SHORT', candles, emaFast, emaSlow, i)) judge('PULLBACK', 'SHORT', regimeIsDown, shortRsiOk);
+    }
+
     if (regimeIsUp && crossedUp && rsiOk && adxOk && atrValue !== undefined) {
       const stopLoss = last.close - this.config.atrStopMultiplier * atrValue;
       return {
@@ -229,6 +253,7 @@ export class TrendRegimeStrategy implements Strategy {
         stopLoss,
         indicators: indicatorsSnapshot,
         conditions: longConditions,
+        candidates,
         reason:
           `EMA${this.config.emaFast} cruzou acima da EMA${this.config.emaSlow}, ` +
           `RSI(${this.config.rsiPeriod})=${rsiValue.toFixed(1)} dentro de ` +
@@ -236,16 +261,6 @@ export class TrendRegimeStrategy implements Strategy {
           `(close > EMA${this.config.emaRegime})`,
       };
     }
-
-    const [shortRsiMin, shortRsiMax] = this.shortRsiBand();
-    const crossedDown = this.crossedBelow(emaFast, emaSlow, i);
-    const shortRsiOk = rsiValue !== undefined && rsiValue >= shortRsiMin && rsiValue <= shortRsiMax;
-    const shortConditions: EntryConditions = {
-      side: 'SHORT',
-      cross: { ok: crossedDown, emaFast: emaFast[i], emaSlow: emaSlow[i] },
-      regime: { ok: regimeIsDown, close: lastRegimeClose, ema: lastEmaRegime, bandPct: band },
-      rsi: { ok: shortRsiOk, value: rsiValue, min: shortRsiMin, max: shortRsiMax },
-    };
 
     if (this.shortEnabled && regimeIsDown && crossedDown && shortRsiOk && adxOk && atrValue !== undefined) {
       const stopLoss = last.close + this.config.atrStopMultiplier * atrValue;
@@ -258,6 +273,7 @@ export class TrendRegimeStrategy implements Strategy {
         stopLoss,
         indicators: indicatorsSnapshot,
         conditions: shortConditions,
+        candidates,
         reason:
           `EMA${this.config.emaFast} cruzou abaixo da EMA${this.config.emaSlow}, ` +
           `RSI(${this.config.rsiPeriod})=${rsiValue.toFixed(1)} dentro de ` +
@@ -278,6 +294,7 @@ export class TrendRegimeStrategy implements Strategy {
           stopLoss: last.close - this.config.atrStopMultiplier * atrValue,
           indicators: { ...indicatorsSnapshot, pullback: 1 },
           conditions: longConditions,
+          candidates,
           reason:
             `Pullback: EMA${this.config.emaFast} > EMA${this.config.emaSlow} nos últimos ${this.pullbackLookback} candles, ` +
             `preço tocou a EMA${this.config.emaFast} e fechou acima da máxima anterior, regime de alta`,
@@ -293,6 +310,7 @@ export class TrendRegimeStrategy implements Strategy {
           stopLoss: last.close + this.config.atrStopMultiplier * atrValue,
           indicators: { ...indicatorsSnapshot, pullback: 1 },
           conditions: shortConditions,
+          candidates,
           reason:
             `Pullback (short): EMA${this.config.emaFast} < EMA${this.config.emaSlow} nos últimos ${this.pullbackLookback} candles, ` +
             `preço tocou a EMA${this.config.emaFast} e fechou abaixo da mínima anterior, regime de baixa`,
@@ -312,7 +330,39 @@ export class TrendRegimeStrategy implements Strategy {
         adxOk,
       ),
     );
-    return { ...waiting, conditions: judgedShort ? shortConditions : longConditions };
+    return {
+      ...waiting,
+      conditions: judgedShort ? shortConditions : longConditions,
+      ...(candidates.length ? { candidates } : {}),
+    };
+  }
+
+  /** One triggered setup with every gate result (same rules, same order as the entry checks). */
+  private candidate(
+    setupType: SetupType,
+    side: 'LONG' | 'SHORT',
+    close: number,
+    atrValue: number | undefined,
+    regimeOk: boolean,
+    rsiOk: boolean,
+    adxOk: boolean,
+  ): EntryCandidate {
+    const gates: EntryCandidate['gates'] = [
+      { gate: 'SIDE', ok: side === 'LONG' || this.shortEnabled },
+      { gate: 'REGIME', ok: regimeOk },
+      { gate: 'RSI', ok: rsiOk },
+      ...(this.adxMin > 0 ? [{ gate: 'ADX' as const, ok: adxOk }] : []),
+      { gate: 'INDICATORS', ok: atrValue !== undefined },
+    ];
+    const offset = atrValue === undefined ? undefined : this.config.atrStopMultiplier * atrValue;
+    return {
+      setupType,
+      side,
+      gates,
+      accepted: gates.every((g) => g.ok),
+      price: close,
+      ...(offset !== undefined ? { stopLoss: side === 'LONG' ? close - offset : close + offset } : {}),
+    };
   }
 
   private get trailingSinceEntry(): boolean {

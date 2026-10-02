@@ -11,11 +11,14 @@ import { EXCHANGE_GATEWAY } from '../exchange/exchange-gateway.interface';
 import type { ExchangeGateway } from '../exchange/exchange-gateway.interface';
 import { Candle } from '../exchange/types/candle.type';
 import { checkIntraCandleExit } from '../backtest/intra-candle-exit.util';
+import { CandidateRecorderService } from '../candidates/candidate-recorder.service';
 import { RiskContextBuilderService } from '../risk/risk-context-builder.service';
+import type { RiskContext, RiskDecision } from '../risk/risk.interface';
 import { RiskManagerService } from '../risk/risk-manager.service';
 import { SignalsService } from '../risk/signals.service';
 import { StrategyRegistryService } from '../strategy/strategy-registry.service';
 import type { Signal, StrategyContext } from '../strategy/strategy.interface';
+import { lastClosedCandles, strategyWindowSize } from '../strategy/strategy-window';
 import { OrdersService } from '../trades/orders.service';
 import { entryOrderSide, exitOrderSide, sideFromSignal } from '../trades/position-math.util';
 import type { TradeDocument, TradeExitReason, TradeMode, TradeSide } from '../trades/schemas/trade.schema';
@@ -43,6 +46,17 @@ export type CycleOutcome =
   | { status: 'already-evaluated'; candleCloseTime: number }
   /** A newly closed candle was evaluated; missedCandles = closed candles skipped while the worker was down. */
   | { status: 'evaluated'; candleCloseTime: number; missedCandles: number };
+
+/** What tryEnter learned before (or without) sending an order — read by the candidate ledger only. */
+interface EntryTrace {
+  riskContext?: RiskContext;
+  decision?: RiskDecision;
+}
+
+/** Entry candle close (ms): entries are stamped with it, as in the backtest. */
+function entryCloseTime(trade: { entryTime?: Date | string | number }): number | undefined {
+  return trade.entryTime === undefined || trade.entryTime === null ? undefined : new Date(trade.entryTime).getTime();
+}
 
 /** What evaluating a candle came to: the last signal the strategy gave and what was done with it. */
 interface CandleResult {
@@ -84,6 +98,7 @@ export class ExecutionService {
     @Optional()
     @Inject(EVALUATION_SNAPSHOT_STORE)
     private readonly snapshots: EvaluationSnapshotStore = new InMemoryEvaluationSnapshotStore(),
+    @Optional() private readonly candidateRecorder?: CandidateRecorderService,
   ) {}
 
   /**
@@ -98,7 +113,7 @@ export class ExecutionService {
     const candles = await this.fetchClosedCandles(
       symbol,
       this.strategyConfig.timeframe,
-      this.strategyConfig.emaRegime + 10,
+      strategyWindowSize(this.strategyConfig.emaRegime),
     );
     const lastCandle = candles[candles.length - 1];
     if (!lastCandle) return { status: 'no-candles' };
@@ -176,7 +191,12 @@ export class ExecutionService {
       // Read-only, so an open position is judged on its exit rules as the real cycle did.
       const openTrade = await this.tradesService.findOpenPosition(symbol, mode);
       const openPosition: StrategyContext['openPosition'] = openTrade
-        ? { side: openTrade.side === 'SHORT' ? 'SHORT' : 'LONG', entryPrice: openTrade.entryPrice, stopLoss: openTrade.stopLoss }
+        ? {
+            side: openTrade.side === 'SHORT' ? 'SHORT' : 'LONG',
+            entryPrice: openTrade.entryPrice,
+            stopLoss: openTrade.stopLoss,
+            entryTime: entryCloseTime(openTrade),
+          }
         : null;
       const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, openPosition);
       const decision = {
@@ -296,6 +316,7 @@ export class ExecutionService {
           side: openTrade.side === 'SHORT' ? 'SHORT' : 'LONG',
           entryPrice: openTrade.entryPrice,
           stopLoss: openTrade.stopLoss,
+          entryTime: entryCloseTime(openTrade),
         });
         this.logCycle(symbol, signal);
         lastSignal = signal;
@@ -313,8 +334,17 @@ export class ExecutionService {
       const signal = this.tryEvaluate(strategy.onCandleClosed.bind(strategy), symbol, candles, regimeCandles, null);
       this.logCycle(symbol, signal);
       lastSignal = signal;
+      const trace: EntryTrace = {};
+      let entered = false;
       if (signal && sideFromSignal(signal.action)) {
-        const entry = await this.tryEnter(signal, symbol, mode, lastCandle);
+        let entry: Awaited<ReturnType<ExecutionService['tryEnter']>>;
+        try {
+          entry = await this.tryEnter(signal, symbol, mode, lastCandle, trace);
+        } catch (err) {
+          await this.recordCandidates({ mode, symbol, strategy, signal, candles, regimeCandles, trace, entry: 'FAILED' });
+          throw err;
+        }
+        entered = entry.entered;
         decision = entry.entered
           ? { outcome: 'ENTERED', reason: signal.reason }
           : { outcome: 'NOT_ENTERED', reason: `Sinal vetado pelo risco: ${entry.rejectReason}` };
@@ -322,6 +352,19 @@ export class ExecutionService {
         decision = signal
           ? { outcome: 'NOT_ENTERED', reason: signal.reason }
           : { outcome: 'SKIPPED', reason: 'Estratégia sem histórico suficiente ou falhou ao avaliar' };
+      }
+      // After the decision is final (orders included): the ledger can't influence it.
+      if (signal) {
+        await this.recordCandidates({
+          mode,
+          symbol,
+          strategy,
+          signal,
+          candles,
+          regimeCandles,
+          trace,
+          entry: entered ? 'ENTERED' : undefined,
+        });
       }
     }
     return { signal: lastSignal, decision };
@@ -331,7 +374,53 @@ export class ExecutionService {
   private async fetchRegimeCandles(symbol: string): Promise<Candle[] | undefined> {
     return this.strategyConfig.regimeTimeframe === this.strategyConfig.timeframe
       ? undefined
-      : this.fetchClosedCandles(symbol, this.strategyConfig.regimeTimeframe, this.strategyConfig.emaRegime + 10);
+      : this.fetchClosedCandles(symbol, this.strategyConfig.regimeTimeframe, strategyWindowSize(this.strategyConfig.emaRegime));
+  }
+
+  /**
+   * Candidate ledger for this candle (only when a setup triggered): every candidate with its gates,
+   * the real risk decision and pause state, and — when the pause vetoed it — what RiskManager would
+   * have said right after a manual resume (a pure re-evaluation; nothing is placed). Best-effort:
+   * never fails or changes the cycle.
+   */
+  private async recordCandidates(args: {
+    mode: TradeMode;
+    symbol: string;
+    strategy: ReturnType<StrategyRegistryService['get']>;
+    signal: Signal;
+    candles: Candle[];
+    regimeCandles: Candle[] | undefined;
+    trace: EntryTrace;
+    entry?: 'ENTERED' | 'FAILED';
+  }): Promise<void> {
+    const { signal, trace } = args;
+    if (!this.candidateRecorder?.enabled || !signal.candidates?.length) return;
+    try {
+      const state = await this.controlService.getState();
+      const paused = trace.riskContext?.isPaused ?? state.isPaused;
+      const riskIfResumed =
+        trace.decision?.rejectReason === 'BOT_PAUSED' && trace.riskContext
+          ? // A resume clears the pause and restarts the stop streak (stopStreakResetAt); daily PnL stays.
+            this.riskManager.evaluate(signal, { ...trace.riskContext, isPaused: false, consecutiveStopLosses: 0 })
+          : undefined;
+      await this.candidateRecorder.record({
+        mode: args.mode,
+        symbol: args.symbol,
+        timeframe: this.strategyConfig.timeframe,
+        regimeTimeframe: this.strategyConfig.regimeTimeframe,
+        signal,
+        strategyParams: args.strategy.getParams?.(),
+        candles: args.candles,
+        regimeCandles: args.regimeCandles,
+        risk: trace.decision,
+        riskIfResumed,
+        pause: { paused, reason: paused ? state.pauseReason : undefined },
+        entry: args.entry,
+        evaluatedAt: new Date(),
+      });
+    } catch (err) {
+      this.logger.warn(`${WORKER_LOG} candidate_ledger_failed symbol=${args.symbol} error="${(err as Error).message}"`);
+    }
   }
 
   /** Logs signal=HOLD/ENTER_LONG/ENTER_SHORT/EXIT/SKIP + reason every cycle, not just entries/exits. */
@@ -360,6 +449,7 @@ export class ExecutionService {
     symbol: string,
     mode: TradeMode,
     lastCandle: Candle,
+    trace: EntryTrace = {},
   ): Promise<{ entered: boolean; rejectReason?: string }> {
     const side = sideFromSignal(signal.action)!;
     const riskCtx = await this.riskContextBuilder.build(
@@ -370,6 +460,8 @@ export class ExecutionService {
       this.reconciliation.isOk(),
     );
     const decision = this.riskManager.evaluate(signal, riskCtx);
+    trace.riskContext = riskCtx;
+    trace.decision = decision;
     await this.signalsService.record(signal, decision, mode);
 
     if (!decision.approved || !decision.qty) {
@@ -608,7 +700,8 @@ export class ExecutionService {
       // Tagged so the incident layer reports "Binance API" rather than a generic cycle failure.
       throw new MarketDataError((err as Error).message, err);
     }
-    return candles.filter((c) => c.isClosed);
+    // Exactly the window the backtest simulates (the forming kline, when present, is dropped here).
+    return lastClosedCandles(candles, limit);
   }
 
   /** Confirms the loop is alive even when nothing happens for a while (no entries/exits). */

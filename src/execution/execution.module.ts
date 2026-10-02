@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { getModelToken, MongooseModule } from '@nestjs/mongoose';
 import type { Model } from 'mongoose';
+import { CandidatesModule } from '../candidates/candidates.module';
 import { ControlModule } from '../control/control.module';
 import { ExchangeModule } from '../exchange/exchange.module';
 import { ReportsModule } from '../reports/reports.module';
@@ -28,6 +29,7 @@ import { UserDataStreamService } from './user-data-stream.service';
     TradesModule,
     ControlModule,
     ReportsModule,
+    CandidatesModule,
   ],
   providers: [
     ExecutionService,

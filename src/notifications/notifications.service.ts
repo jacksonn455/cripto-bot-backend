@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
+import { formatDuration } from '../control/duration.util';
 import { TRADE_CLOSED, TRADE_OPENED, type TradeClosedEvent, type TradeOpenedEvent } from '../trades/trade-events';
 import {
   describeNotification,
@@ -67,8 +68,10 @@ export class NotificationsService implements OnModuleInit {
   }
 
   @OnEvent('bot.resumed')
-  onBotResumed(): void {
-    void this.dispatch({ kind: 'alert', level: 'info', message: 'Bot resumed' });
+  onBotResumed(payload?: { pausedForMs?: number | null; pauseReason?: string | null }): void {
+    const after = typeof payload?.pausedForMs === 'number' ? ` after ${formatDuration(payload.pausedForMs)}` : '';
+    const why = payload?.pauseReason ? ` (paused by ${payload.pauseReason})` : '';
+    void this.dispatch({ kind: 'alert', level: 'info', message: `Bot resumed${after}${why}` });
   }
 
   @OnEvent('backtest.completed')

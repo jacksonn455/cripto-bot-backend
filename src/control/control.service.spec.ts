@@ -2,7 +2,32 @@ import { TradesService } from '../trades/trades.service';
 import { ControlService } from './control.service';
 import { InMemoryEvaluationSnapshotStore } from './evaluation-snapshot.store';
 
-function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } = {}) {
+/** Minimal pause_episodes model: the calls ControlService makes, over an array. */
+function fakeEpisodeModel(failing = false) {
+  const docs: Array<Record<string, unknown>> = [];
+  const newestOpen = () =>
+    [...docs].filter((d) => d.resumedAt === undefined).sort((a, b) => +(b.pausedAt as Date) - +(a.pausedAt as Date))[0] ?? null;
+  const fail = () => Promise.reject(new Error('mongo down'));
+  return {
+    docs,
+    create: jest.fn((doc: Record<string, unknown>) => {
+      if (failing) return fail();
+      const d = { _id: `e${docs.length + 1}`, ...doc };
+      docs.push(d);
+      return Promise.resolve(d);
+    }),
+    findOne: jest.fn(() => ({ sort: () => (failing ? fail() : Promise.resolve(newestOpen())) })),
+    updateOne: jest.fn((filter: { _id: string }, update: { $set?: Record<string, unknown>; $push?: Record<string, unknown> }) => {
+      const d = docs.find((x) => x._id === filter._id)!;
+      Object.assign(d, update.$set ?? {});
+      for (const [k, v] of Object.entries(update.$push ?? {})) d[k] = [...((d[k] as unknown[]) ?? []), v];
+      return Promise.resolve({});
+    }),
+    find: jest.fn(() => ({ sort: () => ({ limit: () => ({ lean: () => Promise.resolve([...docs].reverse()) }) }) })),
+  };
+}
+
+function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[]; episodes?: ReturnType<typeof fakeEpisodeModel> } = {}) {
   const state: Record<string, unknown> = { isPaused: false };
   const stateModel = {
     findOne: jest.fn().mockImplementation(() => Promise.resolve({ ...state })),
@@ -20,6 +45,7 @@ function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } 
 
   const gateway = {
     getOpenOrders: jest.fn().mockResolvedValue(overrides.openOrders ?? []),
+    getBalance: jest.fn().mockResolvedValue({ asset: 'USDT', free: 1000, locked: 0 }),
     cancelOrder: jest.fn().mockResolvedValue(undefined),
     placeOrder: jest.fn().mockResolvedValue({
       symbol: 'BTCUSDT',
@@ -37,6 +63,7 @@ function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } 
 
   const tradesService = {
     findAllOpen: jest.fn().mockResolvedValue(overrides.openTrades ?? []),
+    countOpenPositions: jest.fn().mockResolvedValue(0),
     closePosition: jest.fn().mockResolvedValue(undefined),
     // Real settlement math on top of the mocked persistence.
     settlePosition(...args: Parameters<TradesService['settlePosition']>) {
@@ -61,6 +88,8 @@ function makeDeps(overrides: { openOrders?: unknown[]; openTrades?: unknown[] } 
     { mode: 'PAPER' } as never,
     eventEmitter as never,
     { enabled: true, pollIntervalSeconds: 60 } as never,
+    undefined,
+    overrides.episodes as never,
   );
 
   return { service, stateModel, gateway, tradesService, eventEmitter, state };
@@ -77,12 +106,67 @@ describe('ControlService', () => {
 
     await service.pause('MANUAL');
     expect(await service.isPaused()).toBe(true);
-    expect(eventEmitter.emit).toHaveBeenCalledWith('bot.paused', { reason: 'MANUAL' });
+    expect(eventEmitter.emit).toHaveBeenCalledWith('bot.paused', { reason: 'MANUAL', pausedAt: expect.any(String) });
 
     await service.resume();
     expect(await service.isPaused()).toBe(false);
     expect((await service.getState()).pauseReason).toBeUndefined();
-    expect(eventEmitter.emit).toHaveBeenCalledWith('bot.resumed', {});
+    expect(eventEmitter.emit).toHaveBeenCalledWith('bot.resumed', {
+      pauseReason: 'MANUAL',
+      pausedAt: expect.any(String),
+      pausedForMs: expect.any(Number),
+    });
+  });
+
+  describe('pause episodes (observability)', () => {
+    beforeEach(() => jest.useFakeTimers({ now: new Date('2026-10-01T10:00:00Z') }));
+    afterEach(() => jest.useRealTimers());
+
+    it('records when and why the bot paused, how long it stayed paused, and exposes it on the status', async () => {
+      const episodes = fakeEpisodeModel();
+      const { service, state } = makeDeps({ episodes });
+
+      await service.pause('CONSECUTIVE_STOPS_LIMIT');
+      expect(state.pausedAt).toEqual(new Date('2026-10-01T10:00:00Z'));
+      jest.setSystemTime(new Date('2026-10-01T13:30:00Z'));
+      const status = await service.getStatus();
+      expect(status).toMatchObject({ paused: true, pauseReason: 'CONSECUTIVE_STOPS_LIMIT', pausedForMs: 3.5 * 3_600_000 });
+
+      await service.resume();
+      expect(episodes.docs).toEqual([
+        expect.objectContaining({
+          reason: 'CONSECUTIVE_STOPS_LIMIT',
+          mode: 'PAPER',
+          pausedAt: new Date('2026-10-01T10:00:00Z'),
+          resumedAt: new Date('2026-10-01T13:30:00Z'),
+          durationMs: 3.5 * 3_600_000,
+        }),
+      ]);
+      expect(state.pausedAt).toBeUndefined();
+      expect((await service.getStatus()).pausedForMs).toBeUndefined();
+    });
+
+    it('a pause while already paused keeps the original start and is appended to the same episode', async () => {
+      const episodes = fakeEpisodeModel();
+      const { service, state } = makeDeps({ episodes });
+
+      await service.pause('CONSECUTIVE_STOPS_LIMIT');
+      jest.setSystemTime(new Date('2026-10-01T11:00:00Z'));
+      await service.pause('DAILY_LOSS_LIMIT');
+
+      expect(state.pausedAt).toEqual(new Date('2026-10-01T10:00:00Z'));
+      expect(state.pauseReason).toBe('DAILY_LOSS_LIMIT');
+      expect(episodes.docs).toHaveLength(1);
+      expect(episodes.docs[0].additionalReasons).toEqual([{ reason: 'DAILY_LOSS_LIMIT', at: new Date('2026-10-01T11:00:00Z') }]);
+    });
+
+    it('still pauses (the safety mechanism) when the episode cannot be written', async () => {
+      const { service } = makeDeps({ episodes: fakeEpisodeModel(true) });
+      await service.pause('DAILY_LOSS_LIMIT');
+      expect(await service.isPaused()).toBe(true);
+      await service.resume();
+      expect(await service.isPaused()).toBe(false);
+    });
   });
 
   it('auto-pauses when the daily loss limit is breached', async () => {

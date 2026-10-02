@@ -77,6 +77,7 @@ export const validationSchema = Joi.object({
 
   PAPER_INITIAL_BALANCE_ASSET: Joi.string().default('USDT'),
   PAPER_INITIAL_BALANCE_AMOUNT: Joi.number().positive().default(10000),
+  PAPER_SIMULATED_SHORTS: Joi.boolean().default(false),
 
   // --- TrendRegimeStrategy ---
   TREND_SYMBOLS: Joi.string().default('BTCUSDT,ETHUSDT'),
@@ -182,6 +183,12 @@ export const validationSchema = Joi.object({
   REPORTS_CACHE_TTL_SECONDS: Joi.number().integer().positive().default(30),
 
   // --- OpenAI Agents (optional, analysis only) ---
+  CANDIDATE_LEDGER_ENABLED: Joi.boolean().default(true),
+  CANDIDATE_SHADOW_REFRESH_MINUTES: Joi.number().integer().min(0).max(10080).default(60),
+  // 'enforce' is deliberately not accepted yet: no judge may change a trading decision.
+  AI_JUDGE_MODE: Joi.string().valid('off', 'shadow').default('off'),
+  AI_JUDGE: Joi.string().valid('noop', 'baseline').default('noop'),
+  AI_JUDGE_TIMEOUT_MS: Joi.number().integer().min(100).max(120000).default(5000),
   OPENAI_AGENTS_ENABLED: Joi.boolean().default(false),
   OPENAI_API_KEY: Joi.string().when('OPENAI_AGENTS_ENABLED', {
     is: true,

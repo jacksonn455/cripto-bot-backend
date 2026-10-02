@@ -12,6 +12,8 @@ import { SignalsService } from '../../risk/signals.service';
 import { StrategyRegistryService } from '../../strategy/strategy-registry.service';
 import { GetTradesQueryDto } from '../../trades/dto/get-trades-query.dto';
 import { TradesService } from '../../trades/trades.service';
+import { buildCandidateFeatures } from '../../candidates/candidate-features';
+import { lastClosedCandles, strategyWindowSize } from '../../strategy/strategy-window';
 import { AiToolSpec, defineTool, orUndefined } from './ai-tool';
 
 const MODE = z.enum(['BACKTEST', 'PAPER', 'LIVE']).nullable().describe('Modo; null = todos');
@@ -256,43 +258,46 @@ export class TradingDataTools {
           return { error: `symbol not configured; available: ${this.strategyConfig.symbols.join(', ')}` };
         }
         const c = this.strategyConfig;
-        const limit = c.emaRegime + 20;
+        // The exact window and feature math the strategy and the candidate ledger use, so the
+        // agent never sees a different EMA200 than the one the bot decided on.
+        const size = strategyWindowSize(c.emaRegime);
         const [candles, regimeCandles] = await Promise.all([
-          this.closedCandles(symbol, c.timeframe, limit),
-          this.closedCandles(symbol, c.regimeTimeframe, limit),
+          this.closedCandles(symbol, c.timeframe, size),
+          c.regimeTimeframe === c.timeframe ? Promise.resolve(undefined) : this.closedCandles(symbol, c.regimeTimeframe, size),
         ]);
-        const closes = candles.map((k) => k.close);
         const last = candles[candles.length - 1];
         if (!last) return { error: 'no market data available' };
-        const pick = (series: Array<number | undefined>) => series[series.length - 1] ?? null;
-        const atr = pick(this.indicators.atr(c.atrPeriod, candles.map((k) => k.high), candles.map((k) => k.low), closes));
-        const regimeCloses = regimeCandles.map((k) => k.close);
-        const emaRegime = pick(this.indicators.ema(c.emaRegime, regimeCloses));
-        const lastRegimeClose = regimeCloses[regimeCloses.length - 1] ?? null;
-        const back = closes[Math.max(0, closes.length - 25)];
+        const f = buildCandidateFeatures(
+          candles,
+          regimeCandles,
+          {
+            emaFast: c.emaFast,
+            emaSlow: c.emaSlow,
+            emaRegime: c.emaRegime,
+            rsiPeriod: c.rsiPeriod,
+            atrPeriod: c.atrPeriod,
+            adxPeriod: c.adxPeriod ?? 14,
+            regimeBandPct: c.regimeBandPct ?? 0,
+          },
+          this.indicators,
+        );
+        const STATE = { UP: 'up', DOWN: 'down', NEUTRAL: 'flat', UNKNOWN: 'unknown' } as const;
         return {
           symbol,
           timeframe: c.timeframe,
           lastCandleClose: new Date(last.closeTime).toISOString(),
           close: last.close,
-          changePctLast24Candles: back ? ((last.close - back) / back) * 100 : null,
-          emaFast: pick(this.indicators.ema(c.emaFast, closes)),
-          emaSlow: pick(this.indicators.ema(c.emaSlow, closes)),
-          rsi: pick(this.indicators.rsi(c.rsiPeriod, closes)),
-          atr,
-          atrPctOfPrice: atr !== null ? (atr / last.close) * 100 : null,
+          changePctLast24Candles: f.return24 !== null ? f.return24 * 100 : null,
+          emaFast: f.emaFast,
+          emaSlow: f.emaSlow,
+          rsi: f.rsi,
+          atr: f.atr,
+          atrPctOfPrice: f.atrToPrice !== null ? f.atrToPrice * 100 : null,
           regime: {
             timeframe: c.regimeTimeframe,
-            close: lastRegimeClose,
-            emaRegime,
-            state:
-              emaRegime === null || lastRegimeClose === null
-                ? 'unknown'
-                : lastRegimeClose > emaRegime
-                  ? 'up'
-                  : lastRegimeClose < emaRegime
-                    ? 'down'
-                    : 'flat',
+            close: f.regime.close,
+            emaRegime: f.regime.ema,
+            state: STATE[f.regime.state],
           },
         };
       },
@@ -326,8 +331,8 @@ export class TradingDataTools {
     });
   }
 
-  private async closedCandles(symbol: string, interval: string, limit: number) {
-    const candles = await this.gateway.getCandles({ symbol, interval, limit: limit + 2 });
-    return candles.filter((k) => k.isClosed);
+  private async closedCandles(symbol: string, interval: string, size: number) {
+    const candles = await this.gateway.getCandles({ symbol, interval, limit: size + 2 });
+    return lastClosedCandles(candles, size);
   }
 }

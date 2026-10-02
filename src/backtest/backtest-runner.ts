@@ -1,8 +1,11 @@
 import { Candle } from '../exchange/types/candle.type';
-import { RiskContext } from '../risk/risk.interface';
+import { buildCandidateFeatures, featureParamsFrom } from '../candidates/candidate-features';
+import { buildCandidateRecords } from '../candidates/candidate-records';
+import type { CandidateRecord } from '../candidates/candidate.types';
+import { RiskContext, RiskDecision } from '../risk/risk.interface';
 import { RiskManagerService } from '../risk/risk-manager.service';
 import { nextStopStreak } from '../risk/stop-streak.util';
-import type { Strategy, StrategyContext } from '../strategy/strategy.interface';
+import type { Signal, Strategy, StrategyContext } from '../strategy/strategy.interface';
 import { computePnl, entryOrderSide, exitOrderSide, sideFromSignal, unrealizedPnl } from '../trades/position-math.util';
 import type { TradeSide } from '../trades/schemas/trade.schema';
 import {
@@ -14,7 +17,7 @@ import {
   SimulatedTrade,
   SymbolSeries,
 } from './backtest.types';
-import { checkIntraCandleExit } from './intra-candle-exit.util';
+import { stepOpenPosition } from './position-step.util';
 
 const DAY_MS = 86_400_000;
 
@@ -108,6 +111,8 @@ export class BacktestRunner {
     const trades: SimulatedTrade[] = [];
     const equityCurve: EquityPoint[] = [];
     const signals: RejectedSignalRecord[] = [];
+    // Observability only, and only on request: never read by the simulation.
+    const candidates: CandidateRecord[] | undefined = this.params.recordCandidates ? [] : undefined;
 
     const close = (st: SymbolState, price: number, time: number, reason: SimulatedTrade['exitReason'], gapped = false) => {
       const trade = this.closePosition(st, st.position!, price, time, reason, gapped);
@@ -153,38 +158,26 @@ export class BacktestRunner {
         const regimeWindow = st.regime?.slice(regimeLookback ? Math.max(0, st.regimeEnd - regimeLookback) : 0, st.regimeEnd);
 
         if (st.position) {
-          const intraCandleExit = checkIntraCandleExit(st.position, candle);
-          if (intraCandleExit) {
-            const reason = intraCandleExit.reason === 'SL' && st.position.trailed ? 'TRAILING' : intraCandleExit.reason;
-            const closedTrade = close(st, intraCandleExit.exitPrice, candle.closeTime, reason, intraCandleExit.gapped);
+          const p = st.position;
+          const step = stepOpenPosition(p, candle, (openPosition) =>
+            this.tryEvaluate(st.symbol, window, regimeWindow, openPosition),
+          );
+          if (step.kind === 'EXIT') {
+            const closedTrade = close(st, step.price, candle.closeTime, step.reason, step.gapped);
             consecutiveStopLosses = nextStopStreak(consecutiveStopLosses, closedTrade.exitReason);
           } else {
-            const signal = this.tryEvaluate(st.symbol, window, regimeWindow, {
-              side: st.position.side,
-              entryPrice: st.position.entryPrice,
-              stopLoss: st.position.stopLoss,
-              entryTime: st.position.entryTime,
-            });
-            if (signal?.action === 'EXIT') {
-              const closedTrade = close(st, signal.price, candle.closeTime, 'SIGNAL');
-              consecutiveStopLosses = nextStopStreak(consecutiveStopLosses, closedTrade.exitReason);
-            } else if (signal?.trailingStop !== undefined) {
-              // Ratchet: the stop only ever tightens. Checked inside the next candles like any stop.
-              const p = st.position;
-              const tighter = p.side === 'SHORT' ? signal.trailingStop < p.stopLoss : signal.trailingStop > p.stopLoss;
-              if (tighter) {
-                p.stopLoss = signal.trailingStop;
-                p.trailed = true;
-              }
-            }
+            // Ratchet: the stop only ever tightens. Checked inside the next candles like any stop.
+            p.stopLoss = step.stopLoss;
+            p.trailed = step.trailed;
           }
         }
 
         if (!st.position) {
           const signal = this.tryEvaluate(st.symbol, window, regimeWindow, null);
           const side = signal ? sideFromSignal(signal.action) : null;
+          let decision: RiskDecision | undefined;
           if (signal && side) {
-            const decision = this.riskManager.evaluate(signal, this.riskContext(st, states, balance, dailyPnl, consecutiveStopLosses));
+            decision = this.riskManager.evaluate(signal, this.riskContext(st, states, balance, dailyPnl, consecutiveStopLosses));
             signals.push({
               candleTime: signal.candleTime,
               symbol: signal.symbol,
@@ -211,6 +204,9 @@ export class BacktestRunner {
                 trailed: false,
               };
             }
+          }
+          if (candidates && signal?.candidates?.length) {
+            candidates.push(...this.candidateRecords(st.symbol, signal, decision, window, regimeWindow));
           }
         }
 
@@ -240,7 +236,34 @@ export class BacktestRunner {
       if (st.position && lastCandle) close(st, lastCandle.close, lastCandle.closeTime, 'MANUAL');
     }
 
-    return { trades, equityCurve, signals, finalBalance: balance, stopPauses };
+    return { trades, equityCurve, signals, finalBalance: balance, stopPauses, ...(candidates ? { candidates } : {}) };
+  }
+
+  /**
+   * Ledger rows for the setups that triggered on this candle (mode BACKTEST; the service adds the
+   * runId). Pause is never on in a simulation: the stop-streak pause shows up as a RISK veto.
+   */
+  private candidateRecords(
+    symbol: string,
+    signal: Signal,
+    decision: RiskDecision | undefined,
+    window: Candle[],
+    regimeWindow: Candle[] | undefined,
+  ): CandidateRecord[] {
+    const params = featureParamsFrom(this.strategy.getParams?.());
+    const last = window[window.length - 1];
+    return buildCandidateRecords({
+      mode: 'BACKTEST',
+      symbol,
+      timeframe: last.interval,
+      regimeTimeframe: regimeWindow?.[regimeWindow.length - 1]?.interval,
+      signal,
+      features: params ? buildCandidateFeatures(window, regimeWindow, params) : null,
+      risk: decision,
+      pause: { paused: false },
+      entry: decision?.approved && decision.qty ? 'ENTERED' : undefined,
+      evaluatedAt: new Date(last.closeTime),
+    });
   }
 
   private riskContext(

@@ -21,6 +21,15 @@ export class ControlController {
     return this.controlService.getStatus();
   }
 
+  @Get('pauses')
+  @ApiOperation({
+    summary: 'Pause episodes, newest first: when each started, why, when it was resumed and how long it lasted',
+    description: 'Candidates lost during each pause: GET /candidates/pauses.',
+  })
+  listPauses() {
+    return this.controlService.listPauseEpisodes(50);
+  }
+
   @Post('pause')
   @UseGuards(ControlApiKeyGuard)
   @ApiOperation({ summary: 'Pause the bot (blocks new entries; existing positions still monitored)' })
