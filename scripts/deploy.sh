@@ -40,7 +40,7 @@ if [ -f dist/main.js ]; then cp -a dist dist.prev; fi
 restore_previous_build() {
   if [ -d dist.prev ]; then rm -rf dist && mv dist.prev dist && echo "previous build restored to dist/" >&2; fi
 }
-if ! NODE_OPTIONS=--max-old-space-size=768 "${PNPM[@]}" run build || [ ! -f dist/main.js ]; then
+if ! NODE_OPTIONS=--max-old-space-size=1024 "${PNPM[@]}" run build || [ ! -f dist/main.js ]; then
   restore_previous_build
   fail "build failed (the running process was not touched)"
 fi
